@@ -1,0 +1,36 @@
+# Local Git directory used because the sandbox exposes a read-only empty .git directory.
+.git_local/
+/tools/gitw
+
+# Codex / agent runtime metadata
+.agents/
+.codex/
+
+# ROS / catkin build outputs
+build/
+devel/
+install/
+log/
+.catkin_tools/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime logs and large ROS recordings
+*.log
+*.bag
+*.db3
+.ros/

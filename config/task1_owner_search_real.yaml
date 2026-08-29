@@ -1,0 +1,211 @@
+waypoint_name: living_room
+waypoint_file: /home/ubuntu20/waypoints.xml
+owner_image_path: /home/ubuntu20/catkin_ws/src/wpb_task1_owner_search/data/owner
+
+# Real WPB Home topics. These are produced by wpb_home_bringup, rplidar_ros,
+# kinect2_bridge, and yoloworld_perception in the real launch file.
+image_topic: /kinect2/qhd/image_color_rect
+detections_topic: /perception/person_detections_2d
+points_topic: /kinect2/qhd/points
+scan_topic: /scan
+odom_topic: /odom
+cmd_vel_topic: /cmd_vel
+# Offline robot speech path. offline_voice_bridge uses PiperTTS on /voice/say
+# and faster-whisper publishes recognized text on /voice/asr_text.
+say_topic: /voice/say
+pause_yolo_topic: /yoloworld/pause
+
+# Hardware-topic readiness checks. Keep these on for real robot testing so the
+# task fails early if a driver is missing instead of rotating blindly.
+require_kinect: true
+require_lidar: true
+require_odom: true
+hardware_check_timeout: 90.0
+
+# Clear stale obstacle data before sending the room goal, and retry once after
+# a navigation failure. This helps after repeated runs leave local costmaps busy.
+clear_costmaps_before_navigation: true
+retry_navigation_after_clear: true
+clear_costmaps_service: /move_base/clear_costmaps
+clear_costmaps_timeout: 5.0
+
+# Owner verification. InsightFace runs on CPU so YOLO-World can keep cuda:0.
+face_verify_enabled: true
+face_verify_required: true
+allow_unverified_owner: false
+face_auto_download: false
+face_model_name: buffalo_sc
+face_model_root: /home/ubuntu20/.insightface
+face_ctx_id: -1
+face_det_size: 480
+face_det_thresh: 0.35
+face_accept_threshold: 0.45
+face_reject_threshold: 0.25
+face_fast_reject: true
+# Keep reference photos upright. Candidate crops are still rotated for lying people,
+# but rotating the reference set creates unstable false accepts on sideways non-owners.
+face_reference_try_rotations: false
+face_crop_padding: 0.28
+face_crop_top_ratio: 0.68
+# If the YOLO person box is taller than wide, use only the upper crop without rotation.
+# If it is wider than tall, try left/right side crops with several widths and rotated face checks.
+face_crop_lying_side_ratio: 0.50
+face_crop_lying_extra_side_ratios: [0.45, 0.65, 0.75]
+face_crop_try_rotations: true
+face_candidate_enhance: true
+
+# Person candidate selection from YOLO-World detections.
+detection_min_score: 0.30
+detection_min_area_ratio: 0.015
+verify_top_k: 1
+verify_during_scan: true
+verify_after_scan_top_k: 1
+candidate_cooldown: 1.0
+candidate_collection_interval: 0.5
+scan_candidate_pool_size: 6
+
+# Real robot scan defaults: 180 degrees, slower than simulation for safety.
+navigate_enabled: true
+navigate_timeout: 120.0
+scan_angular_speed: -0.25
+scan_duration: 13.0
+scan_total_angle: 3.1416
+scan_timeout: 35.0
+scan_after_arrival_delay: 0.2
+scan_return_to_owner: true
+return_angular_speed: 0.25
+
+# After owner verification, center the owner in the camera before action recognition.
+center_owner_enabled: true
+center_owner_timeout: 5.0
+center_owner_tolerance: 0.06
+center_owner_angular_gain: 0.65
+center_owner_max_angular_speed: 0.30
+center_owner_lost_turn_speed: 0.10
+
+# Owner action recognition. The node samples the robot Kinect camera for 7s,
+# using the verified owner's ROI when available, then speaks the final action.
+action_recognition_enabled: true
+action_model_path: /home/ubuntu20/catkin_ws/src/wpr_simulation/models/vision/yolo11n-pose.pt
+action_device: cuda:0
+action_require_gpu: true
+action_imgsz: 416
+action_conf: 0.30
+action_iou: 0.45
+action_half: true
+action_sample_seconds: 7.0
+action_sample_rate: 3.0
+action_min_keypoint_conf: 0.25
+action_max_det: 4
+action_pause_yolo: false
+action_use_owner_roi: true
+action_roi_padding: 0.35
+action_min_pose_samples: 5
+action_static_required_ratio: 0.65
+# Fall detection thresholds. Lower values make one-time falls easier to catch.
+action_fall_center_drop: 0.06
+action_fall_torso_drop: 0.20
+action_fall_aspect_gain: 0.25
+action_fall_lie_ratio_gain: 0.35
+action_fall_late_lie_ratio: 0.45
+action_fall_height_shrink_ratio: 0.82
+action_fall_early_upright_ratio: 0.35
+# Static lying classification. If there is no fall transition, use Kinect point
+# cloud surface height to split lying on the floor from lying on sofa/bed/chair.
+lying_surface_classification_enabled: true
+lying_surface_camera_height: 0.85
+lying_ground_max_surface_height: 0.35
+lying_furniture_min_surface_height: 0.42
+lying_ground_bbox_bottom_ratio: 0.88
+lying_ground_bbox_center_ratio: 0.62
+action_report_standing: false
+action_speech_hold: 3.2
+
+# Real robot response after a waving owner is detected. This samples the Kinect
+# organized point cloud inside the verified owner's 2D bbox and uses lidar only
+# as a forward safety guard.
+approach_on_waving_enabled: true
+approach_timeout: 25.0
+approach_linear_speed: 0.18
+approach_linear_gain: 0.25
+approach_min_linear_speed: 0.06
+approach_angular_gain: 0.45
+approach_max_angular_speed: 0.25
+approach_stop_distance: 0.70
+approach_standoff_distance: 0.70
+approach_distance_tolerance: 0.08
+approach_bearing_tolerance: 0.06
+approach_forward_bearing_limit: 0.45
+approach_arrival_stable_cycles: 1
+approach_missing_data_grace: 0.7
+approach_missing_linear_scale: 0.35
+approach_command_smoothing: 0.45
+approach_center_tolerance: 0.12
+approach_target_height_ratio: 0.55
+approach_lost_turn_speed: 0.10
+approach_front_scan_degrees: 12.0
+approach_scan_max_age: 0.8
+approach_require_lidar: false
+approach_lidar_stop_distance: 0.55
+approach_lidar_margin: 0.08
+approach_pointcloud_mode: auto
+approach_pointcloud_max_age: 1.0
+approach_pointcloud_min_samples: 30
+approach_pointcloud_stride: 8
+approach_pointcloud_roi_x_margin: 0.25
+approach_pointcloud_roi_y_min_ratio: 0.15
+approach_pointcloud_roi_y_max_ratio: 0.85
+approach_pointcloud_depth_percentile: 35.0
+approach_pointcloud_surface_band: 0.30
+approach_min_depth: 0.35
+approach_max_depth: 5.0
+approach_help_prompt: "请问您需要什么帮助？"
+
+# Real robot response after a fallen / lying / sitting owner is detected. Unlike
+# waving approach, this captures one Kinect point-cloud position before moving,
+# then drives by odometry without requiring repeated camera detections. This
+# avoids losing the owner when the target leaves the camera during forward motion.
+fall_approach_enabled: true
+fall_approach_action_labels: [falling, lying_ground, lying, sitting]
+fall_approach_position_sample_seconds: 0.9
+fall_approach_min_position_samples: 2
+fall_approach_standoff_distance: 0.75
+fall_approach_distance_tolerance: 0.08
+fall_approach_linear_speed: 0.14
+fall_approach_min_linear_speed: 0.05
+fall_approach_linear_gain: 0.25
+fall_approach_turn_timeout: 8.0
+fall_approach_drive_timeout: 18.0
+fall_approach_max_travel_distance: 1.50
+fall_approach_lidar_stop_distance: 0.55
+fall_approach_lidar_margin: 0.08
+
+# Arm motion after reaching a fallen owner. Sitting and elevated static lying do
+# not use this; static lying only uses this when the point cloud classifies the
+# owner as lying on the floor, not on sofa/bed/chair.
+# Uses the same
+# /wpb_home/mani_ctrl JointState interface as wpb_home_python3/scripts/mani_ctrl.py:
+# name=['lift','gripper'], position[0]=lift height, position[1]=gripper gap.
+fall_assist_arm_enabled: true
+fall_assist_arm_action_labels: [falling, lying_ground]
+mani_ctrl_topic: /wpb_home/mani_ctrl
+fall_assist_arm_extend_lift: 0.50
+fall_assist_arm_extend_gripper: 0.12
+fall_assist_arm_retract_lift: 0.0
+fall_assist_arm_retract_gripper: 0.12
+fall_assist_arm_lift_velocity: 0.5
+fall_assist_arm_gripper_velocity: 5.0
+fall_assist_arm_extend_wait: 3.0
+fall_assist_arm_hold_seconds: 4.0
+fall_assist_arm_retract_wait: 3.0
+fall_assist_arm_command_rate: 5.0
+
+speak_on_start: true
+speak_on_arrival: false
+speak_on_owner_found: true
+speak_on_finish: true
+say_wait_for_subscribers: true
+say_wait_timeout: 20.0
+say_repeat_count: 1
+say_repeat_interval: 0.25
+say_after_publish_delay: 1.0

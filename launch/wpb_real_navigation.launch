@@ -1,0 +1,95 @@
+<launch>
+  <arg name="start_base" default="true" />
+  <arg name="start_lidar" default="true" />
+  <arg name="start_kinect" default="true" />
+  <arg name="start_map_server" default="true" />
+  <arg name="start_amcl" default="true" />
+  <arg name="use_jie_lidar_loc" default="true" />
+  <arg name="start_move_base" default="true" />
+  <arg name="start_wp_manager" default="true" />
+  <arg name="start_rviz" default="true" />
+
+  <arg name="serial_port" default="/dev/ftdi" />
+  <arg name="rplidar_port" default="/dev/rplidar" />
+  <arg name="rplidar_baudrate" default="115200" />
+  <arg name="map" default="$(find wpb_home_tutorials)/maps/map.yaml" />
+  <arg name="waypoints" default="/home/$(env USER)/waypoints.xml" />
+  <arg name="model" default="$(find wpb_home_bringup)/urdf/wpb_home.urdf" />
+  <arg name="rvizconfig" default="$(find wpb_home_tutorials)/rviz/nav.rviz" />
+  <arg name="kinect_fps_limit" default="15.0" />
+  <arg name="kinect_queue_size" default="2" />
+  <arg name="kinect_worker_threads" default="2" />
+  <arg name="kinect_start_qhd_points" default="true" />
+
+  <!-- Real robot TF tree. This mirrors wpb_home_bringup/launch/normal.launch. -->
+  <param name="robot_description" command="$(find xacro)/xacro $(arg model)" />
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+
+  <!-- Real base driver: publishes /odom and consumes /cmd_vel through /dev/ftdi. -->
+  <node if="$(arg start_base)" pkg="wpb_home_bringup" type="wpb_home_core" name="wpb_home_core" output="screen">
+    <param name="serial_port" type="string" value="$(arg serial_port)" />
+    <rosparam file="$(find wpb_home_bringup)/config/wpb_home.yaml" command="load" />
+  </node>
+
+  <!-- Real RPLidar driver and WaterPlus lidar filter: /scan_raw -> /scan. -->
+  <node if="$(arg start_lidar)" name="rplidarNode" pkg="rplidar_ros" type="rplidarNode" output="screen">
+    <param name="serial_port" type="string" value="$(arg rplidar_port)" />
+    <param name="serial_baudrate" type="int" value="$(arg rplidar_baudrate)" />
+    <param name="frame_id" type="string" value="laser" />
+    <param name="inverted" type="bool" value="false" />
+    <param name="angle_compensate" type="bool" value="true" />
+    <remap from="scan" to="scan_raw" />
+  </node>
+
+  <node if="$(arg start_lidar)" pkg="wpb_home_bringup" type="wpb_home_lidar_filter" name="wpb_home_lidar_filter">
+    <param name="pub_topic" value="/scan" />
+  </node>
+
+  <!-- Real Kinect2 driver. Use a lighter task-specific launch to avoid starting
+       SD and HD point clouds on every owner-search run. -->
+  <include if="$(arg start_kinect)" file="$(find wpb_task1_owner_search)/launch/kinect2_owner_search.launch">
+    <arg name="fps_limit" value="$(arg kinect_fps_limit)" />
+    <arg name="queue_size" value="$(arg kinect_queue_size)" />
+    <arg name="worker_threads" value="$(arg kinect_worker_threads)" />
+    <arg name="start_qhd_points" value="$(arg kinect_start_qhd_points)" />
+    <arg name="respawn" value="false" />
+  </include>
+
+  <node if="$(arg start_map_server)" name="map_server" pkg="map_server" type="map_server" args="$(arg map)" />
+
+  <group if="$(arg start_amcl)">
+    <!-- Default to jie_ware lidar localization. It replaces AMCL by publishing map -> odom. -->
+    <node if="$(arg use_jie_lidar_loc)" pkg="jie_ware" type="lidar_loc" name="lidar_loc" output="screen">
+      <param name="base_frame" value="base_footprint" />
+      <param name="odom_frame" value="odom" />
+      <param name="laser_frame" value="laser" />
+      <param name="laser_topic" value="scan" />
+    </node>
+
+    <include unless="$(arg use_jie_lidar_loc)" file="$(find wpb_home_tutorials)/nav_lidar/amcl_omni.launch" />
+  </group>
+
+  <node if="$(arg start_move_base)" pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+    <rosparam file="$(find wpb_home_tutorials)/nav_lidar/costmap_common_params.yaml" command="load" ns="global_costmap" />
+    <rosparam file="$(find wpb_home_tutorials)/nav_lidar/costmap_common_params.yaml" command="load" ns="local_costmap" />
+    <rosparam file="$(find wpb_home_tutorials)/nav_lidar/local_costmap_params.yaml" command="load" />
+    <rosparam file="$(find wpb_home_tutorials)/nav_lidar/global_costmap_params.yaml" command="load" />
+    <rosparam file="$(find wpb_home_tutorials)/nav_lidar/local_planner_params.yaml" command="load" />
+    <rosparam param="WpbhLocalPlanner/max_vel_trans">0.35</rosparam>
+    <rosparam param="WpbhLocalPlanner/max_vel_rot">0.8</rosparam>
+    <rosparam param="WpbhLocalPlanner/acc_scale_trans">1.5</rosparam>
+    <rosparam param="WpbhLocalPlanner/acc_scale_rot">0.6</rosparam>
+    <param name="base_global_planner" value="global_planner/GlobalPlanner" />
+    <param name="use_dijkstra" value="true" />
+    <param name="base_local_planner" value="wpbh_local_planner/WpbhLocalPlanner" />
+    <param name="controller_frequency" value="10" type="double" />
+    <param name="oscillation_timeout" value="8" type="double" />
+    <param name="oscillation_distance" value="0.2" type="double" />
+  </node>
+
+  <node if="$(arg start_wp_manager)" pkg="waterplus_map_tools" type="wp_manager" name="wp_manager" output="screen">
+    <param name="load" type="string" value="$(arg waypoints)" />
+  </node>
+
+  <node if="$(arg start_rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(arg rvizconfig)" />
+</launch>

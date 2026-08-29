@@ -1,0 +1,26 @@
+<launch>
+  <arg name="show_yolo_viewer" default="false" />
+  <arg name="start_rviz" default="true" />
+  <arg name="start_voice" default="true" />
+  <arg name="start_asr" default="true" />
+  <arg name="start_tts" default="true" />
+  <arg name="start_sound_play" default="true" />
+  <arg name="map" default="$(find wpb_home_tutorials)/maps/map.yaml" />
+  <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
+  <arg name="device" default="cuda:0" />
+
+  <include file="$(find wpb_task1_owner_search)/launch/task1_owner_search_real.launch">
+    <arg name="start_robot" value="true" />
+    <arg name="start_yolo" value="true" />
+    <arg name="show_yolo_viewer" value="$(arg show_yolo_viewer)" />
+    <arg name="start_voice" value="$(arg start_voice)" />
+    <arg name="start_asr" value="$(arg start_asr)" />
+    <arg name="start_tts" value="$(arg start_tts)" />
+    <arg name="start_sound_play" value="$(arg start_sound_play)" />
+    <arg name="start_task" value="false" />
+    <arg name="start_rviz" value="$(arg start_rviz)" />
+    <arg name="map" value="$(arg map)" />
+    <arg name="waypoint_file" value="$(arg waypoint_file)" />
+    <arg name="device" value="$(arg device)" />
+  </include>
+</launch>

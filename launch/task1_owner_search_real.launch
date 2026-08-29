@@ -1,0 +1,99 @@
+<launch>
+  <arg name="start_robot" default="true" />
+  <arg name="start_yolo" default="true" />
+  <arg name="show_yolo_viewer" default="true" />
+  <arg name="start_voice" default="true" />
+  <arg name="start_asr" default="true" />
+  <arg name="start_tts" default="true" />
+  <arg name="start_sound_play" default="true" />
+  <arg name="start_task" default="true" />
+  <arg name="start_rviz" default="true" />
+
+  <arg name="start_base" default="true" />
+  <arg name="start_lidar" default="true" />
+  <arg name="start_kinect" default="true" />
+  <arg name="start_map_server" default="true" />
+  <arg name="start_amcl" default="true" />
+  <arg name="use_jie_lidar_loc" default="true" />
+  <arg name="start_move_base" default="true" />
+  <arg name="start_wp_manager" default="true" />
+
+  <arg name="serial_port" default="/dev/ftdi" />
+  <arg name="rplidar_port" default="/dev/rplidar" />
+  <arg name="map" default="$(find wpb_home_tutorials)/maps/map.yaml" />
+  <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
+  <arg name="waypoint_name" default="living_room" />
+  <arg name="navigate_enabled" default="true" />
+
+  <arg name="image_topic" default="/kinect2/qhd/image_color_rect" />
+  <arg name="detections_topic" default="/perception/person_detections_2d" />
+  <arg name="points_topic" default="/kinect2/qhd/points" />
+  <arg name="yolo_debug_image_topic" default="/perception/yoloworld/debug_image" />
+  <arg name="owner_image_path" default="$(find wpb_task1_owner_search)/data/owner" />
+  <arg name="device" default="cuda:0" />
+
+  <group if="$(arg start_robot)">
+    <include file="$(find wpb_task1_owner_search)/launch/wpb_real_navigation.launch">
+      <arg name="start_base" value="$(arg start_base)" />
+      <arg name="start_lidar" value="$(arg start_lidar)" />
+      <arg name="start_kinect" value="$(arg start_kinect)" />
+      <arg name="start_map_server" value="$(arg start_map_server)" />
+      <arg name="start_amcl" value="$(arg start_amcl)" />
+      <arg name="use_jie_lidar_loc" value="$(arg use_jie_lidar_loc)" />
+      <arg name="start_move_base" value="$(arg start_move_base)" />
+      <arg name="start_wp_manager" value="$(arg start_wp_manager)" />
+      <arg name="start_rviz" value="$(arg start_rviz)" />
+      <arg name="serial_port" value="$(arg serial_port)" />
+      <arg name="rplidar_port" value="$(arg rplidar_port)" />
+      <arg name="map" value="$(arg map)" />
+      <arg name="waypoints" value="$(arg waypoint_file)" />
+    </include>
+  </group>
+
+  <group if="$(arg start_yolo)">
+    <node pkg="yoloworld_perception" type="yoloworld_node.py" name="yoloworld" output="screen">
+      <param name="image_topic" value="$(arg image_topic)" />
+      <param name="model_path" value="$(find yoloworld_perception)/models/yolov8s-world-person.pt" />
+      <param name="device" value="$(arg device)" />
+      <param name="require_gpu" value="true" />
+      <param name="imgsz" value="416" />
+      <param name="conf" value="0.30" />
+      <param name="iou" value="0.45" />
+      <param name="max_det" value="5" />
+      <param name="process_every_n" value="2" />
+      <param name="classes" value="person" />
+      <param name="publish_debug" value="true" />
+      <remap from="~detections" to="$(arg detections_topic)" />
+      <remap from="~debug_image" to="$(arg yolo_debug_image_topic)" />
+    </node>
+  </group>
+
+  <node if="$(arg show_yolo_viewer)" pkg="yoloworld_perception" type="yoloworld_debug_viewer.py" name="yoloworld_bbox_debug_viewer" output="screen">
+    <param name="image_topic" value="$(arg image_topic)" />
+    <param name="debug_image_topic" value="$(arg yolo_debug_image_topic)" />
+    <param name="show_raw" value="false" />
+    <param name="show_debug" value="true" />
+    <param name="debug_window" value="Owner YOLO-Person Box Real" />
+  </node>
+
+  <group if="$(arg start_voice)">
+    <!-- Offline robot speech chain: PiperTTS listens on /voice/say and
+         faster-whisper publishes recognized text on /voice/asr_text. -->
+    <include file="$(find offline_voice_bridge)/launch/offline_voice_zh.launch">
+      <arg name="start_asr" value="$(arg start_asr)" />
+      <arg name="start_tts" value="$(arg start_tts)" />
+      <arg name="start_sound_play" value="$(arg start_sound_play)" />
+    </include>
+  </group>
+
+  <node if="$(arg start_task)" pkg="wpb_task1_owner_search" type="task1_find_owner_real.py" name="task1_find_owner_real" output="screen">
+    <rosparam command="load" file="$(find wpb_task1_owner_search)/config/task1_owner_search_real.yaml" />
+    <param name="image_topic" value="$(arg image_topic)" />
+    <param name="detections_topic" value="$(arg detections_topic)" />
+    <param name="points_topic" value="$(arg points_topic)" />
+    <param name="owner_image_path" value="$(arg owner_image_path)" />
+    <param name="waypoint_file" value="$(arg waypoint_file)" />
+    <param name="waypoint_name" value="$(arg waypoint_name)" />
+    <param name="navigate_enabled" value="$(arg navigate_enabled)" />
+  </node>
+</launch>

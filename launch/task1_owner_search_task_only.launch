@@ -1,0 +1,25 @@
+<launch>
+  <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
+  <arg name="waypoint_name" default="living_room" />
+  <arg name="navigate_enabled" default="true" />
+  <arg name="image_topic" default="/kinect2/qhd/image_color_rect" />
+  <arg name="detections_topic" default="/perception/person_detections_2d" />
+  <arg name="points_topic" default="/kinect2/qhd/points" />
+  <arg name="owner_image_path" default="$(find wpb_task1_owner_search)/data/owner" />
+
+  <include file="$(find wpb_task1_owner_search)/launch/task1_owner_search_real.launch">
+    <arg name="start_robot" value="false" />
+    <arg name="start_yolo" value="false" />
+    <arg name="show_yolo_viewer" value="false" />
+    <arg name="start_voice" value="false" />
+    <arg name="start_task" value="true" />
+    <arg name="start_rviz" value="false" />
+    <arg name="waypoint_file" value="$(arg waypoint_file)" />
+    <arg name="waypoint_name" value="$(arg waypoint_name)" />
+    <arg name="navigate_enabled" value="$(arg navigate_enabled)" />
+    <arg name="image_topic" value="$(arg image_topic)" />
+    <arg name="detections_topic" value="$(arg detections_topic)" />
+    <arg name="points_topic" value="$(arg points_topic)" />
+    <arg name="owner_image_path" value="$(arg owner_image_path)" />
+  </include>
+</launch>

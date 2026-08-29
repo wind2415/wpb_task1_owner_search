@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>wpb_task1_owner_search</name>
+  <version>0.1.0</version>
+  <description>Real WPB Home owner-search task with owner action recognition.</description>
+
+  <maintainer email="ubuntu20@example.com">ubuntu20</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>actionlib</depend>
+  <depend>actionlib_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>geometry_msgs</depend>
+  <depend>move_base_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>perception_msgs</depend>
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <exec_depend>amcl</exec_depend>
+  <exec_depend>jie_ware</exec_depend>
+  <exec_depend>kinect2_bridge</exec_depend>
+  <exec_depend>map_server</exec_depend>
+  <exec_depend>move_base</exec_depend>
+  <exec_depend>offline_voice_bridge</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rplidar_ros</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <exec_depend>sound_play</exec_depend>
+  <exec_depend>waterplus_map_tools</exec_depend>
+  <exec_depend>wpb_home_bringup</exec_depend>
+  <exec_depend>wpb_home_tutorials</exec_depend>
+  <exec_depend>wpbh_local_planner</exec_depend>
+  <exec_depend>wpr_simulation</exec_depend>
+  <exec_depend>yoloworld_perception</exec_depend>
+</package>
