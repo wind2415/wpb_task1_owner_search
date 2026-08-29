@@ -1,6 +1,7 @@
 # Local Git directory used because the sandbox exposes a read-only empty .git directory.
 .git_local/
 /tools/gitw
+.ssh_github/
 
 # Codex / agent runtime metadata
 .agents/
