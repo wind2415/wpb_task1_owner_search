@@ -13,6 +13,8 @@ cmd_vel_topic: /cmd_vel
 # Offline robot speech path. offline_voice_bridge uses PiperTTS on /voice/say
 # and faster-whisper publishes recognized text on /voice/asr_text.
 say_topic: /voice/say
+asr_topic: /voice/asr_text
+electrical_switch_state_topic: /electrical_switch/state
 pause_yolo_topic: /yoloworld/pause
 
 # Hardware-topic readiness checks. Keep these on for real robot testing so the
@@ -53,6 +55,10 @@ face_crop_lying_side_ratio: 0.50
 face_crop_lying_extra_side_ratios: [0.45, 0.65, 0.75]
 face_crop_try_rotations: true
 face_candidate_enhance: true
+# Run the primary lying-face crop first. Borderline candidates keep the full
+# multi-crop/enhancement fallback, while clearly low scores reject immediately.
+face_fast_pass_enabled: true
+face_fast_pass_reject_threshold: 0.30
 
 # Person candidate selection from YOLO-World detections.
 detection_min_score: 0.30
@@ -179,6 +185,10 @@ fall_approach_drive_timeout: 18.0
 fall_approach_max_travel_distance: 1.50
 fall_approach_lidar_stop_distance: 0.55
 fall_approach_lidar_margin: 0.08
+fall_approach_extra_close_enabled: true
+fall_approach_extra_close_distance: 0.25
+fall_approach_extra_close_speed: 0.08
+fall_approach_extra_close_timeout: 6.0
 
 # Arm motion after reaching a fallen owner. Sitting and elevated static lying do
 # not use this; static lying only uses this when the point cloud classifies the
@@ -199,6 +209,39 @@ fall_assist_arm_extend_wait: 3.0
 fall_assist_arm_hold_seconds: 4.0
 fall_assist_arm_retract_wait: 3.0
 fall_assist_arm_command_rate: 5.0
+
+# After a normal sitting or elevated lying owner has been approached, ask for
+# an electrical-switch command. The state is recorded and published as the
+# string on/off/unknown; connect a real switch driver to this topic separately.
+electrical_switch_instruction_enabled: true
+electrical_switch_instruction_source: direct_asr
+electrical_switch_instruction_timeout: 0.0
+electrical_switch_instruction_window_seconds: 5.0
+electrical_switch_instruction_asr_settle_seconds: 1.0
+electrical_switch_instruction_max_empty_windows: 0
+electrical_switch_prompt: "请指示。"
+electrical_switch_prompt_hold: 1.5
+electrical_switch_asr_capture_device: default
+electrical_switch_asr_sample_rate: 16000
+electrical_switch_asr_channels: 1
+electrical_switch_asr_model_path: /home/ubuntu20/catkin_ws/src/offline_voice_bridge/models/whisper/faster-whisper-small
+electrical_switch_asr_hf_endpoint: https://huggingface.co
+electrical_switch_asr_device: cpu
+electrical_switch_asr_compute_type: int8
+electrical_switch_asr_language: zh
+electrical_switch_asr_beam_size: 1
+electrical_switch_asr_vad_filter: false
+electrical_switch_asr_no_speech_threshold: 0.6
+electrical_switch_asr_keep_wav: false
+electrical_switch_asr_wav_dir: /dev/shm
+electrical_switch_ollama_url: http://127.0.0.1:11434/api/chat
+electrical_switch_ollama_model: qwen3.5:2b
+electrical_switch_ollama_timeout: 30.0
+electrical_switch_ollama_keep_alive: 10m
+electrical_switch_ollama_max_tokens: 20
+electrical_switch_reply_on: "好的，已开启电气开关。"
+electrical_switch_reply_off: "好的，已关闭电气开关。"
+electrical_switch_reply_unknown: "抱歉，我没有听出开关指令。"
 
 speak_on_start: true
 speak_on_arrival: false

@@ -2,12 +2,17 @@
   <arg name="show_yolo_viewer" default="false" />
   <arg name="start_rviz" default="true" />
   <arg name="start_voice" default="true" />
-  <arg name="start_asr" default="true" />
+  <arg name="start_asr" default="false" />
   <arg name="start_tts" default="true" />
   <arg name="start_sound_play" default="true" />
+  <arg name="asr_capture_device" default="default" />
+  <arg name="asr_energy_threshold" default="200" />
   <arg name="map" default="$(find wpb_home_tutorials)/maps/map.yaml" />
   <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
   <arg name="device" default="cuda:0" />
+
+  <param name="/asr/capture_device" value="$(arg asr_capture_device)" />
+  <param name="/asr/energy_threshold" value="$(arg asr_energy_threshold)" />
 
   <include file="$(find wpb_task1_owner_search)/launch/task1_owner_search_real.launch">
     <arg name="start_robot" value="true" />
@@ -17,6 +22,8 @@
     <arg name="start_asr" value="$(arg start_asr)" />
     <arg name="start_tts" value="$(arg start_tts)" />
     <arg name="start_sound_play" value="$(arg start_sound_play)" />
+    <arg name="asr_capture_device" value="$(arg asr_capture_device)" />
+    <arg name="asr_energy_threshold" value="$(arg asr_energy_threshold)" />
     <arg name="start_task" value="false" />
     <arg name="start_rviz" value="$(arg start_rviz)" />
     <arg name="map" value="$(arg map)" />

@@ -3,9 +3,13 @@
   <arg name="start_yolo" default="true" />
   <arg name="show_yolo_viewer" default="true" />
   <arg name="start_voice" default="true" />
-  <arg name="start_asr" default="true" />
+  <arg name="start_asr" default="false" />
   <arg name="start_tts" default="true" />
   <arg name="start_sound_play" default="true" />
+  <!-- Match the wpb_home voice stack: use the ALSA default capture device,
+       and override only if the robot's card routing differs. -->
+  <arg name="asr_capture_device" default="default" />
+  <arg name="asr_energy_threshold" default="200" />
   <arg name="start_task" default="true" />
   <arg name="start_rviz" default="true" />
 
@@ -31,6 +35,10 @@
   <arg name="yolo_debug_image_topic" default="/perception/yoloworld/debug_image" />
   <arg name="owner_image_path" default="$(find wpb_task1_owner_search)/data/owner" />
   <arg name="device" default="cuda:0" />
+
+  <!-- Keep ASR tuning visible before the voice launch loads its nodes. -->
+  <param name="/asr/capture_device" value="$(arg asr_capture_device)" />
+  <param name="/asr/energy_threshold" value="$(arg asr_energy_threshold)" />
 
   <group if="$(arg start_robot)">
     <include file="$(find wpb_task1_owner_search)/launch/wpb_real_navigation.launch">
@@ -83,6 +91,8 @@
       <arg name="start_asr" value="$(arg start_asr)" />
       <arg name="start_tts" value="$(arg start_tts)" />
       <arg name="start_sound_play" value="$(arg start_sound_play)" />
+      <arg name="asr_capture_device" value="$(arg asr_capture_device)" />
+      <arg name="asr_energy_threshold" value="$(arg asr_energy_threshold)" />
     </include>
   </group>
 

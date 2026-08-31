@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # coding: utf-8
 import math
+import audioop
+import json
 import os
+import re
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+import wave
 import xml.etree.ElementTree as ET
 
 import actionlib
@@ -73,6 +80,10 @@ class RealOwnerSearchBeforeAction:
         self.odom_topic = rospy.get_param("~odom_topic", "/odom")
         self.cmd_vel_topic = rospy.get_param("~cmd_vel_topic", "/cmd_vel")
         self.say_topic = rospy.get_param("~say_topic", "/voice/say")
+        self.asr_topic = rospy.get_param("~asr_topic", "/voice/asr_text")
+        self.electrical_switch_state_topic = rospy.get_param(
+            "~electrical_switch_state_topic", "/electrical_switch/state"
+        )
         self.pause_yolo_topic = rospy.get_param("~pause_yolo_topic", "/yoloworld/pause")
 
         self.require_kinect = bool(rospy.get_param("~require_kinect", True))
@@ -106,6 +117,10 @@ class RealOwnerSearchBeforeAction:
         )
         self.face_crop_try_rotations = bool(rospy.get_param("~face_crop_try_rotations", True))
         self.face_candidate_enhance = bool(rospy.get_param("~face_candidate_enhance", True))
+        self.face_fast_pass_enabled = bool(rospy.get_param("~face_fast_pass_enabled", True))
+        self.face_fast_pass_reject_threshold = float(
+            rospy.get_param("~face_fast_pass_reject_threshold", 0.30)
+        )
 
         self.detection_min_score = float(rospy.get_param("~detection_min_score", 0.30))
         self.detection_min_area_ratio = float(rospy.get_param("~detection_min_area_ratio", 0.015))
@@ -226,6 +241,10 @@ class RealOwnerSearchBeforeAction:
             rospy.get_param("~fall_approach_lidar_stop_distance", self.approach_lidar_stop_distance)
         )
         self.fall_approach_lidar_margin = float(rospy.get_param("~fall_approach_lidar_margin", self.approach_lidar_margin))
+        self.fall_approach_extra_close_enabled = bool(rospy.get_param("~fall_approach_extra_close_enabled", True))
+        self.fall_approach_extra_close_distance = float(rospy.get_param("~fall_approach_extra_close_distance", 0.18))
+        self.fall_approach_extra_close_speed = abs(float(rospy.get_param("~fall_approach_extra_close_speed", 0.08)))
+        self.fall_approach_extra_close_timeout = float(rospy.get_param("~fall_approach_extra_close_timeout", 6.0))
 
         self.fall_assist_arm_enabled = bool(rospy.get_param("~fall_assist_arm_enabled", True))
         self.fall_assist_arm_action_labels = self.parse_string_list(
@@ -242,6 +261,88 @@ class RealOwnerSearchBeforeAction:
         self.fall_assist_arm_hold_seconds = float(rospy.get_param("~fall_assist_arm_hold_seconds", 4.0))
         self.fall_assist_arm_retract_wait = float(rospy.get_param("~fall_assist_arm_retract_wait", 3.0))
         self.fall_assist_arm_command_rate = float(rospy.get_param("~fall_assist_arm_command_rate", 5.0))
+
+        self.electrical_switch_instruction_enabled = bool(
+            rospy.get_param("~electrical_switch_instruction_enabled", True)
+        )
+        self.electrical_switch_instruction_source = str(
+            rospy.get_param("~electrical_switch_instruction_source", "direct_asr")
+        ).strip().lower()
+        self.electrical_switch_instruction_timeout = float(
+            rospy.get_param("~electrical_switch_instruction_timeout", 0.0)
+        )
+        self.electrical_switch_instruction_window_seconds = float(
+            rospy.get_param("~electrical_switch_instruction_window_seconds", 5.0)
+        )
+        self.electrical_switch_instruction_asr_settle_seconds = float(
+            rospy.get_param("~electrical_switch_instruction_asr_settle_seconds", 1.0)
+        )
+        self.electrical_switch_instruction_max_empty_windows = int(
+            rospy.get_param("~electrical_switch_instruction_max_empty_windows", 0)
+        )
+        self.electrical_switch_prompt = rospy.get_param("~electrical_switch_prompt", "请指示。")
+        self.electrical_switch_prompt_hold = float(rospy.get_param("~electrical_switch_prompt_hold", 1.5))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        catkin_src_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
+        default_switch_asr_model = os.path.join(
+            catkin_src_dir,
+            "offline_voice_bridge",
+            "models",
+            "whisper",
+            "faster-whisper-small",
+        )
+        self.electrical_switch_asr_capture_device = rospy.get_param(
+            "~electrical_switch_asr_capture_device", rospy.get_param("/asr/capture_device", "default")
+        )
+        self.electrical_switch_asr_sample_rate = int(rospy.get_param("~electrical_switch_asr_sample_rate", 16000))
+        self.electrical_switch_asr_channels = int(rospy.get_param("~electrical_switch_asr_channels", 1))
+        self.electrical_switch_asr_model_path = os.path.expanduser(
+            rospy.get_param("~electrical_switch_asr_model_path", default_switch_asr_model)
+        )
+        self.electrical_switch_asr_hf_endpoint = rospy.get_param(
+            "~electrical_switch_asr_hf_endpoint", "https://huggingface.co"
+        )
+        self.electrical_switch_asr_device = rospy.get_param("~electrical_switch_asr_device", "cpu")
+        self.electrical_switch_asr_compute_type = rospy.get_param("~electrical_switch_asr_compute_type", "int8")
+        self.electrical_switch_asr_language = rospy.get_param("~electrical_switch_asr_language", "zh")
+        self.electrical_switch_asr_beam_size = int(rospy.get_param("~electrical_switch_asr_beam_size", 1))
+        self.electrical_switch_asr_vad_filter = bool(rospy.get_param("~electrical_switch_asr_vad_filter", False))
+        self.electrical_switch_asr_no_speech_threshold = float(
+            rospy.get_param("~electrical_switch_asr_no_speech_threshold", 0.6)
+        )
+        self.electrical_switch_asr_keep_wav = bool(rospy.get_param("~electrical_switch_asr_keep_wav", False))
+        self.electrical_switch_asr_wav_dir = rospy.get_param("~electrical_switch_asr_wav_dir", "/dev/shm")
+        self.electrical_switch_ollama_url = rospy.get_param(
+            "~electrical_switch_ollama_url", "http://127.0.0.1:11434/api/chat"
+        )
+        self.electrical_switch_ollama_model = rospy.get_param(
+            "~electrical_switch_ollama_model", "qwen3.5:2b"
+        )
+        self.electrical_switch_ollama_timeout = float(
+            rospy.get_param("~electrical_switch_ollama_timeout", 30.0)
+        )
+        self.electrical_switch_ollama_keep_alive = rospy.get_param(
+            "~electrical_switch_ollama_keep_alive", "10m"
+        )
+        self.electrical_switch_ollama_max_tokens = max(
+            8, int(rospy.get_param("~electrical_switch_ollama_max_tokens", 20))
+        )
+        self.electrical_switch_reply_on = rospy.get_param(
+            "~electrical_switch_reply_on", "好的，已开启电气开关。"
+        )
+        self.electrical_switch_reply_off = rospy.get_param(
+            "~electrical_switch_reply_off", "好的，已关闭电气开关。"
+        )
+        self.electrical_switch_reply_unknown = rospy.get_param(
+            "~electrical_switch_reply_unknown", "抱歉，我没有听出开关指令。"
+        )
+        self.latest_asr_text = ""
+        self.latest_asr_time = None
+        self.asr_sequence = 0
+        self.asr_history = []
+        self.electrical_switch_asr_model = None
+        self.electrical_switch_asr_ready = False
+        self.electrical_switch_state = "unknown"
 
         self.speak_on_start = bool(rospy.get_param("~speak_on_start", True))
         self.speak_on_arrival = bool(rospy.get_param("~speak_on_arrival", False))
@@ -263,6 +364,9 @@ class RealOwnerSearchBeforeAction:
 
         self.cmd_pub = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         self.say_pub = rospy.Publisher(self.say_topic, String, queue_size=5)
+        self.electrical_switch_state_pub = rospy.Publisher(
+            self.electrical_switch_state_topic, String, queue_size=1, latch=True
+        )
         self.pause_yolo_pub = rospy.Publisher(self.pause_yolo_topic, Bool, queue_size=1, latch=True)
         self.mani_ctrl_pub = rospy.Publisher(self.mani_ctrl_topic, JointState, queue_size=5)
 
@@ -271,6 +375,9 @@ class RealOwnerSearchBeforeAction:
         self.points_sub = rospy.Subscriber(self.points_topic, PointCloud2, self.pointcloud_callback, queue_size=1)
         self.scan_sub = rospy.Subscriber(self.scan_topic, LaserScan, self.scan_callback, queue_size=1)
         self.odom_sub = rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
+        self.asr_sub = rospy.Subscriber(self.asr_topic, String, self.asr_callback, queue_size=10)
+
+        self.publish_electrical_switch_state()
 
         self.move_base = actionlib.SimpleActionClient("move_base", MoveBaseAction)
 
@@ -962,6 +1069,446 @@ class RealOwnerSearchBeforeAction:
             self.latest_odom_xy = (float(position.x), float(position.y))
             self.latest_odom_time = time.time()
 
+    def asr_callback(self, msg):
+        text = str(msg.data).strip()
+        if not text:
+            return
+        now = time.time()
+        with self.lock:
+            self.asr_sequence += 1
+            self.latest_asr_text = text
+            self.latest_asr_time = now
+            self.asr_history.append({"sequence": self.asr_sequence, "time": now, "text": text})
+            if len(self.asr_history) > 100:
+                self.asr_history = self.asr_history[-100:]
+        rospy.loginfo("ASR text received on %s: %s", self.asr_topic, text)
+
+    def collect_asr_since(self, sequence_after):
+        with self.lock:
+            entries = [entry for entry in self.asr_history if entry["sequence"] > sequence_after]
+        if not entries:
+            return "", sequence_after
+
+        parts = []
+        for entry in entries:
+            text = str(entry.get("text", "")).strip()
+            if text:
+                parts.append(text)
+        transcript = " ".join(parts).strip()
+        return transcript, int(entries[-1]["sequence"])
+
+    @staticmethod
+    def write_pcm_wav(path, raw_audio, sample_rate, channels):
+        with wave.open(path, "wb") as wav_file:
+            wav_file.setnchannels(int(channels))
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(int(sample_rate))
+            wav_file.writeframes(raw_audio)
+
+    def ensure_electrical_switch_asr_model(self):
+        if self.electrical_switch_asr_ready and self.electrical_switch_asr_model is not None:
+            return True
+
+        if self.electrical_switch_asr_hf_endpoint:
+            os.environ.setdefault("HF_ENDPOINT", self.electrical_switch_asr_hf_endpoint)
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            rospy.logerr("faster-whisper is not available for direct switch ASR: %s", exc)
+            return False
+
+        model_path = self.electrical_switch_asr_model_path
+        if os.path.sep in model_path and not os.path.exists(model_path):
+            rospy.logerr("Direct switch ASR model path does not exist: %s", model_path)
+            return False
+
+        try:
+            rospy.loginfo(
+                "Loading direct switch ASR model: path=%s device=%s compute=%s",
+                model_path,
+                self.electrical_switch_asr_device,
+                self.electrical_switch_asr_compute_type,
+            )
+            start = time.time()
+            self.electrical_switch_asr_model = WhisperModel(
+                model_path,
+                device=self.electrical_switch_asr_device,
+                compute_type=self.electrical_switch_asr_compute_type,
+            )
+            self.electrical_switch_asr_ready = True
+            rospy.loginfo("Direct switch ASR model loaded in %.2fs", time.time() - start)
+            return True
+        except Exception as exc:
+            self.electrical_switch_asr_model = None
+            self.electrical_switch_asr_ready = False
+            rospy.logerr("Failed to load direct switch ASR model: %s", exc)
+            return False
+
+    def record_electrical_switch_audio_window(self, window_seconds, window_index):
+        sample_rate = max(8000, int(self.electrical_switch_asr_sample_rate))
+        channels = max(1, int(self.electrical_switch_asr_channels))
+        bytes_per_sample = 2
+        target_seconds = max(0.5, float(window_seconds))
+        arecord_seconds = max(1, int(math.ceil(target_seconds)))
+        target_bytes = int(target_seconds * sample_rate * channels * bytes_per_sample)
+        cmd = [
+            "arecord",
+            "-q",
+            "-D",
+            str(self.electrical_switch_asr_capture_device),
+            "-d",
+            str(arecord_seconds),
+            "-f",
+            "S16_LE",
+            "-r",
+            str(sample_rate),
+            "-c",
+            str(channels),
+            "-t",
+            "raw",
+        ]
+
+        rospy.loginfo(
+            "Direct switch ASR window %d: recording %.1fs from ALSA device %s",
+            window_index,
+            target_seconds,
+            self.electrical_switch_asr_capture_device,
+        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=arecord_seconds + 4,
+            )
+        except subprocess.TimeoutExpired as exc:
+            rospy.logerr("Direct switch ASR arecord timed out: %s", exc)
+            return None
+        except OSError as exc:
+            rospy.logerr("Direct switch ASR failed to start arecord: %s", exc)
+            return None
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            rospy.logerr("Direct switch ASR arecord failed: %s", stderr or "unknown error")
+            return None
+
+        raw_audio = proc.stdout[:target_bytes]
+        if not raw_audio:
+            rospy.logerr("Direct switch ASR arecord returned no audio")
+            return None
+
+        rms = audioop.rms(raw_audio, bytes_per_sample)
+        peak = audioop.max(raw_audio, bytes_per_sample)
+        rospy.loginfo("Direct switch ASR window %d audio stats: rms=%d peak=%d", window_index, rms, peak)
+
+        try:
+            os.makedirs(self.electrical_switch_asr_wav_dir, exist_ok=True)
+            wav_path = os.path.join(
+                self.electrical_switch_asr_wav_dir,
+                "task1_switch_instruction_%03d.wav" % window_index,
+            )
+            self.write_pcm_wav(wav_path, raw_audio, sample_rate, channels)
+            return wav_path
+        except Exception as exc:
+            rospy.logerr("Failed to write direct switch ASR wav: %s", exc)
+            return None
+
+    def transcribe_electrical_switch_audio(self, wav_path, window_index):
+        if not self.ensure_electrical_switch_asr_model():
+            return None
+
+        try:
+            start = time.time()
+            segments, _ = self.electrical_switch_asr_model.transcribe(
+                wav_path,
+                language=self.electrical_switch_asr_language,
+                vad_filter=self.electrical_switch_asr_vad_filter,
+                beam_size=self.electrical_switch_asr_beam_size,
+                condition_on_previous_text=False,
+                no_speech_threshold=self.electrical_switch_asr_no_speech_threshold,
+            )
+            transcript = " ".join(segment.text.strip() for segment in segments).strip()
+            rospy.loginfo(
+                "Direct switch ASR window %d transcript: %s (%.2fs)",
+                window_index,
+                transcript or "<empty>",
+                time.time() - start,
+            )
+            return transcript
+        except Exception as exc:
+            rospy.logerr("Direct switch ASR transcription failed: %s", exc)
+            return None
+        finally:
+            if wav_path and not self.electrical_switch_asr_keep_wav:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    def collect_direct_electrical_switch_transcript(self):
+        if not self.ensure_electrical_switch_asr_model():
+            return ""
+
+        window_seconds = max(0.5, self.electrical_switch_instruction_window_seconds)
+        max_empty_windows = max(0, self.electrical_switch_instruction_max_empty_windows)
+        total_timeout = max(0.0, self.electrical_switch_instruction_timeout)
+        deadline = time.time() + total_timeout if total_timeout > 0.0 else None
+        empty_windows = 0
+        window_index = 1
+
+        while not rospy.is_shutdown():
+            if deadline is not None and time.time() >= deadline:
+                rospy.logwarn("Direct switch ASR wait timed out after %.1fs", total_timeout)
+                break
+
+            wav_path = self.record_electrical_switch_audio_window(window_seconds, window_index)
+            if wav_path is None:
+                break
+
+            transcript = self.transcribe_electrical_switch_audio(wav_path, window_index)
+            if transcript is None:
+                break
+            if transcript:
+                return transcript
+
+            empty_windows += 1
+            rospy.logwarn(
+                "Direct switch ASR window %d had no recognized speech; continuing with next %.1fs window",
+                window_index,
+                window_seconds,
+            )
+            if max_empty_windows > 0 and empty_windows >= max_empty_windows:
+                rospy.logwarn("Direct switch ASR stopped after %d empty windows", empty_windows)
+                break
+            window_index += 1
+
+        return ""
+
+    def collect_ros_topic_electrical_switch_transcript(self):
+        with self.lock:
+            sequence_after_prompt = self.asr_sequence
+            self.latest_asr_text = ""
+            self.latest_asr_time = None
+
+        window_seconds = max(0.5, self.electrical_switch_instruction_window_seconds)
+        settle_seconds = max(0.0, self.electrical_switch_instruction_asr_settle_seconds)
+        max_empty_windows = max(0, self.electrical_switch_instruction_max_empty_windows)
+        total_timeout = max(0.0, self.electrical_switch_instruction_timeout)
+        deadline = time.time() + total_timeout if total_timeout > 0.0 else None
+        rate = rospy.Rate(10)
+        empty_windows = 0
+        window_index = 1
+
+        while not rospy.is_shutdown():
+            if deadline is not None and time.time() >= deadline:
+                rospy.logwarn("Electrical switch topic-ASR wait timed out after %.1fs", total_timeout)
+                break
+
+            rospy.loginfo(
+                "Electrical switch topic-ASR window %d: listening for %.1fs on %s",
+                window_index,
+                window_seconds,
+                self.asr_topic,
+            )
+            window_end = time.time() + window_seconds
+            while not rospy.is_shutdown() and time.time() < window_end:
+                if deadline is not None and time.time() >= deadline:
+                    break
+                rate.sleep()
+
+            if settle_seconds > 0.0:
+                settle_end = time.time() + settle_seconds
+                while not rospy.is_shutdown() and time.time() < settle_end:
+                    rate.sleep()
+
+            transcript, sequence_after_prompt = self.collect_asr_since(sequence_after_prompt)
+            if transcript:
+                rospy.loginfo("Electrical switch topic-ASR window %d transcript: %s", window_index, transcript)
+                return transcript
+
+            empty_windows += 1
+            rospy.logwarn(
+                "Electrical switch topic-ASR window %d had no ASR text; continuing with next %.1fs window",
+                window_index,
+                window_seconds,
+            )
+            if max_empty_windows > 0 and empty_windows >= max_empty_windows:
+                rospy.logwarn("Electrical switch topic-ASR stopped after %d empty windows", empty_windows)
+                break
+            window_index += 1
+
+        return ""
+
+    def publish_electrical_switch_state(self):
+        self.electrical_switch_state_pub.publish(String(data=self.electrical_switch_state))
+        rospy.loginfo(
+            "Electrical switch state: %s (topic=%s)",
+            self.electrical_switch_state,
+            self.electrical_switch_state_topic,
+        )
+
+    @staticmethod
+    def parse_electrical_switch_action(content):
+        """Normalize the short JSON response returned by the local LLM."""
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            match = re.search(r"\{.*\}", str(content), re.DOTALL)
+            if not match:
+                return "unknown"
+            try:
+                parsed = json.loads(match.group(0))
+            except (TypeError, ValueError):
+                return "unknown"
+
+        if not isinstance(parsed, dict):
+            return "unknown"
+
+        action_map = {
+            "on": "on",
+            "开": "on",
+            "开启": "on",
+            "打开": "on",
+            "open": "on",
+            "1": "on",
+            "true": "on",
+            "接通": "on",
+            "上电": "on",
+            "off": "off",
+            "关": "off",
+            "关闭": "off",
+            "关掉": "off",
+            "close": "off",
+            "0": "off",
+            "false": "off",
+            "断开": "off",
+            "断电": "off",
+        }
+        values = [parsed.get("action")]
+        values.extend(value for value in parsed.values() if not isinstance(value, (dict, list)))
+        for value in values:
+            action = action_map.get(str(value).strip().lower())
+            if action:
+                return action
+        return "unknown"
+
+    @staticmethod
+    def electrical_switch_keyword_fallback(transcript):
+        """Conservative fallback used when Ollama is unavailable or malformed."""
+        text = str(transcript).strip()
+        negation = re.search(r"(不要|不用|别|不想|无需|不需要|禁止|不能|别把|不用把)", text)
+        if re.search(r"(关|断开|断电|停|拔掉|灭)", text) and not re.search(r"(开|接通|上电|亮)", text):
+            return "off"
+        if (
+            re.search(r"(开|接通|上电|启动|亮)", text)
+            and not negation
+            and not re.search(r"(关|断开|断电|灭)", text)
+        ):
+            return "on"
+        return "unknown"
+
+    def classify_electrical_switch_instruction(self, transcript):
+        """Use local Ollama first, with the reference script's keyword fallback."""
+        prompt = (
+            "/no_think\n"
+            "判断说话内容是否要开启或关闭电气开关。只输出一行 JSON，不要任何解释。\n"
+            '{"action":"on"} 表示开启；{"action":"off"} 表示关闭；'
+            '{"action":"unknown"} 表示与开关无关或无法判断。\n'
+            '示例：“把灯打开” -> {"action":"on"}；“关掉电源” -> {"action":"off"}；'
+            '“今天天气怎么样” -> {"action":"unknown"}\n'
+            "说话内容：%s" % transcript
+        )
+        payload = {
+            "model": self.electrical_switch_ollama_model,
+            "stream": False,
+            "think": False,
+            "format": "json",
+            "keep_alive": self.electrical_switch_ollama_keep_alive,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {
+                "temperature": 0,
+                "top_p": 0.7,
+                "num_predict": self.electrical_switch_ollama_max_tokens,
+                "num_ctx": 1024,
+            },
+        }
+        request = urllib.request.Request(
+            self.electrical_switch_ollama_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=max(1.0, self.electrical_switch_ollama_timeout)
+            ) as response:
+                raw = response.read().decode("utf-8")
+            result = json.loads(raw)
+            content = result.get("message", {}).get("content", "").strip()
+            action = self.parse_electrical_switch_action(content)
+            if action == "unknown":
+                rospy.logwarn("Ollama returned an unknown electrical switch action: %s", content)
+            else:
+                rospy.loginfo("Electrical switch instruction classified by Ollama: %s", action)
+            return action
+        except (OSError, ValueError, TypeError, urllib.error.URLError) as exc:
+            rospy.logwarn("Electrical switch Ollama classification failed: %s", exc)
+            action = self.electrical_switch_keyword_fallback(transcript)
+            rospy.loginfo("Using keyword fallback for electrical switch instruction: %s", action)
+            return action
+
+    def wait_for_electrical_switch_instruction(self):
+        """Ask once, then process owner speech in repeated fixed windows."""
+        if not self.electrical_switch_instruction_enabled:
+            rospy.loginfo("Electrical switch voice interaction is disabled")
+            return "unknown"
+
+        source = self.electrical_switch_instruction_source
+        if source in ("direct", "direct_asr", "mic", "microphone"):
+            if not self.ensure_electrical_switch_asr_model():
+                transcript = ""
+            else:
+                self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+                transcript = self.collect_direct_electrical_switch_transcript()
+        elif source in ("topic", "ros", "ros_topic", "voice_topic"):
+            with self.lock:
+                self.latest_asr_text = ""
+                self.latest_asr_time = None
+            self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+            transcript = self.collect_ros_topic_electrical_switch_transcript()
+        else:
+            rospy.logwarn(
+                "Unknown electrical_switch_instruction_source=%s; falling back to direct_asr",
+                source,
+            )
+            if not self.ensure_electrical_switch_asr_model():
+                transcript = ""
+            else:
+                self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+                transcript = self.collect_direct_electrical_switch_transcript()
+
+        if not transcript:
+            rospy.logwarn(
+                "No electrical switch instruction text received by source=%s",
+                source,
+            )
+            action = "unknown"
+        else:
+            rospy.loginfo("Electrical switch instruction transcript for LLM: %s", transcript)
+            action = self.classify_electrical_switch_instruction(transcript)
+
+        self.electrical_switch_state = action
+        self.publish_electrical_switch_state()
+        reply = {
+            "on": self.electrical_switch_reply_on,
+            "off": self.electrical_switch_reply_off,
+            "unknown": self.electrical_switch_reply_unknown,
+        }.get(action, self.electrical_switch_reply_unknown)
+        self.say(reply)
+        return action
+
     def get_latest_yaw(self):
         with self.lock:
             return self.latest_yaw
@@ -1444,14 +1991,15 @@ class RealOwnerSearchBeforeAction:
         candidates.sort(key=lambda item: item["priority"], reverse=True)
         return candidates[:self.verify_top_k]
 
-    def crop_candidate_face_regions(self, candidate):
+    def crop_candidate_face_regions(self, candidate, include_extra_side_ratios=True):
         crop = candidate.get("crop")
         if crop is None or crop.size == 0:
             return []
         height, width = crop.shape[:2]
         top_ratio = clamp(float(self.face_crop_top_ratio), 0.35, 1.0)
         side_ratios = [float(self.face_crop_lying_side_ratio)]
-        side_ratios.extend(float(ratio) for ratio in self.face_crop_lying_extra_side_ratios)
+        if include_extra_side_ratios:
+            side_ratios.extend(float(ratio) for ratio in self.face_crop_lying_extra_side_ratios)
 
         det = candidate.get("det")
         if det is not None:
@@ -1550,46 +2098,89 @@ class RealOwnerSearchBeforeAction:
         face_count = 0
         elapsed_ms = 0.0
         had_error = False
-        enhancement_passes = [False]
-        if self.face_candidate_enhance:
-            enhancement_passes.append(True)
-        for enhanced in enhancement_passes:
-            for region_name, face_image, allow_rotations in face_regions:
-                if enhanced and not allow_rotations:
-                    continue
-                for variant_name, variant_image in self.face_image_variants(region_name, face_image, enhanced):
-                    for oriented_name, oriented_image in self.face_region_orientations(
-                        variant_name,
-                        variant_image,
-                        allow_rotations,
-                    ):
-                        try:
-                            start = time.time()
-                            faces = self.face_app.get(oriented_image)
-                            elapsed_ms += (time.time() - start) * 1000.0
-                        except Exception as exc:
-                            had_error = True
-                            rospy.logwarn("Face verification failed on %s crop: %s", oriented_name, exc)
-                            continue
 
-                        for candidate_face in faces or []:
-                            face_count += 1
-                            candidate_embedding = self.normalize_embedding(candidate_face.embedding)
-                            if candidate_embedding is None:
+        def run_regions(regions, enhancement_passes):
+            nonlocal best_similarity, best_reference_path, best_region_name
+            nonlocal face_count, elapsed_ms, had_error
+            for enhanced in enhancement_passes:
+                for region_name, face_image, allow_rotations in regions:
+                    if enhanced and not allow_rotations:
+                        continue
+                    for variant_name, variant_image in self.face_image_variants(region_name, face_image, enhanced):
+                        for oriented_name, oriented_image in self.face_region_orientations(
+                            variant_name,
+                            variant_image,
+                            allow_rotations,
+                        ):
+                            try:
+                                start = time.time()
+                                faces = self.face_app.get(oriented_image)
+                                elapsed_ms += (time.time() - start) * 1000.0
+                            except Exception as exc:
+                                had_error = True
+                                rospy.logwarn("Face verification failed on %s crop: %s", oriented_name, exc)
                                 continue
-                            similarity, reference_path = self.best_owner_face_match(candidate_embedding, owner_embeddings)
-                            if best_similarity is None or similarity > best_similarity:
-                                best_similarity = similarity
-                                best_reference_path = reference_path
-                                best_region_name = oriented_name
-                        if best_similarity is not None and best_similarity >= self.face_accept_threshold:
-                            break
-                    if best_similarity is not None and best_similarity >= self.face_accept_threshold:
-                        break
-                if best_similarity is not None and best_similarity >= self.face_accept_threshold:
-                    break
-            if best_similarity is not None and best_similarity >= self.face_accept_threshold:
-                break
+
+                            for candidate_face in faces or []:
+                                face_count += 1
+                                candidate_embedding = self.normalize_embedding(candidate_face.embedding)
+                                if candidate_embedding is None:
+                                    continue
+                                similarity, reference_path = self.best_owner_face_match(
+                                    candidate_embedding,
+                                    owner_embeddings,
+                                )
+                                if best_similarity is None or similarity > best_similarity:
+                                    best_similarity = similarity
+                                    best_reference_path = reference_path
+                                    best_region_name = oriented_name
+                            if best_similarity is not None and best_similarity >= self.face_accept_threshold:
+                                return True
+            return False
+
+        # Most non-owners are far below the threshold in the primary side crop.
+        # Keep the wider/enhanced search for borderline faces so low-confidence
+        # owner views retain the same fallback behavior as before.
+        if self.face_fast_pass_enabled:
+            fast_regions = self.crop_candidate_face_regions(candidate, include_extra_side_ratios=False)
+            accepted = run_regions(fast_regions, [False])
+            if accepted:
+                rospy.loginfo(
+                    "Face owner verdict: accepted by fast pass similarity=%.3f crop=%s faces=%d elapsed=%.1fms",
+                    best_similarity,
+                    best_region_name,
+                    face_count,
+                    elapsed_ms,
+                )
+                return True, best_similarity, "face accepted"
+            if (
+                best_similarity is not None
+                and not had_error
+                and best_similarity <= self.face_fast_pass_reject_threshold
+            ):
+                rospy.loginfo(
+                    "Face owner verdict: rejected by fast pass similarity=%.3f crop=%s faces=%d elapsed=%.1fms",
+                    best_similarity,
+                    best_region_name,
+                    face_count,
+                    elapsed_ms,
+                )
+                return False, best_similarity, "face rejected by fast pass"
+
+        if self.face_fast_pass_enabled:
+            # The primary regions have already been evaluated above. Continue
+            # with only the remaining raw regions, then enhance all eligible
+            # side regions so borderline owner views keep the old fallback.
+            if run_regions(face_regions[len(fast_regions):], [False]):
+                return True, best_similarity, "face accepted"
+            if self.face_candidate_enhance:
+                if run_regions(face_regions, [True]):
+                    return True, best_similarity, "face accepted"
+        else:
+            enhancement_passes = [False]
+            if self.face_candidate_enhance:
+                enhancement_passes.append(True)
+            run_regions(face_regions, enhancement_passes)
 
         if best_similarity is None:
             if had_error:
@@ -2171,6 +2762,106 @@ class RealOwnerSearchBeforeAction:
         rospy.logwarn("Owner blind approach timed out: %s", self.last_approach_failure_reason)
         return False
 
+    def advance_forward_by_distance(self, extra_distance, speed=None, timeout=None, lidar_guard_distance=None, label="owner"):
+        target_distance = max(0.0, float(extra_distance))
+        if target_distance <= 0.0:
+            return True
+
+        move_speed = abs(float(speed)) if speed is not None else self.fall_approach_extra_close_speed
+        move_speed = max(0.03, move_speed)
+        move_timeout = float(timeout) if timeout is not None else self.fall_approach_extra_close_timeout
+        move_timeout = max(1.0, move_timeout)
+        guard_distance = lidar_guard_distance
+        if guard_distance is None:
+            guard_distance = max(0.30, self.fall_approach_lidar_stop_distance + self.fall_approach_lidar_margin)
+
+        start_xy = self.wait_for_odom_xy(timeout=1.0)
+        start_time = time.time()
+        last_loop_time = start_time
+        timed_travelled = 0.0
+        deadline = start_time + move_timeout
+        rate = rospy.Rate(10)
+        used_timed_fallback = start_xy is None
+
+        rospy.loginfo(
+            "%s extra-close advance: target=%.2fm speed=%.2fm/s guard=%.2fm timed_fallback=%s",
+            label,
+            target_distance,
+            move_speed,
+            guard_distance,
+            used_timed_fallback,
+        )
+
+        while not rospy.is_shutdown() and time.time() < deadline:
+            front_distance = self.front_scan_distance()
+            if front_distance is not None and front_distance <= guard_distance:
+                self.stop_base()
+                rospy.loginfo(
+                    "%s extra-close advance stopped by lidar guard: lidar=%.2f guard=%.2f",
+                    label,
+                    front_distance,
+                    guard_distance,
+                )
+                return True
+
+            if start_xy is not None:
+                travelled = self.xy_distance(start_xy, self.get_latest_odom_xy())
+            else:
+                travelled = timed_travelled
+            if travelled is None:
+                travelled = 0.0
+
+            remaining = target_distance - travelled
+            if remaining <= 0.02:
+                self.stop_base()
+                rospy.loginfo(
+                    "%s extra-close advance complete: travelled=%.2f target=%.2f",
+                    label,
+                    travelled,
+                    target_distance,
+                )
+                return True
+
+            twist = Twist()
+            twist.linear.x = min(move_speed, max(0.0, remaining))
+            if front_distance is not None:
+                clearance = front_distance - guard_distance
+                twist.linear.x = min(twist.linear.x, max(0.0, clearance) * 0.35)
+            self.cmd_pub.publish(twist)
+            now = time.time()
+            if start_xy is None:
+                timed_travelled += twist.linear.x * max(0.0, now - last_loop_time)
+            last_loop_time = now
+            rospy.loginfo_throttle(
+                1.0,
+                "%s extra-close advance: travelled=%.2f target=%.2f remaining=%.2f cmd=%.2f lidar=%.2f",
+                label,
+                travelled,
+                target_distance,
+                remaining,
+                twist.linear.x,
+                front_distance if front_distance is not None else -1.0,
+            )
+            rate.sleep()
+
+        self.stop_base()
+        travelled = self.xy_distance(start_xy, self.get_latest_odom_xy()) if start_xy is not None else None
+        if travelled is not None and travelled >= target_distance - 0.10:
+            rospy.logwarn(
+                "%s extra-close advance timed out near target; accepting stop: travelled=%.2f target=%.2f",
+                label,
+                travelled,
+                target_distance,
+            )
+            return True
+        rospy.logwarn(
+            "%s extra-close advance timed out before target: travelled=%s target=%.2f",
+            label,
+            "%.2f" % travelled if travelled is not None else "unknown",
+            target_distance,
+        )
+        return False
+
     def approach_waving_owner(self, owner_candidate=None):
         if not self.approach_on_waving_enabled:
             rospy.loginfo("Approach after waving is disabled")
@@ -2411,14 +3102,21 @@ class RealOwnerSearchBeforeAction:
         self.say(self.action_to_speech(action_label), hold=self.action_speech_hold)
         if normalized_action in self.fall_approach_action_labels:
             approached = self.approach_fallen_owner(owner_candidate, initial_position=initial_approach_position)
-            if approached and normalized_action in self.fall_assist_arm_action_labels:
-                self.perform_fall_assist_arm_motion()
+            if approached:
+                extra_close_completed = True
+                if self.fall_approach_extra_close_enabled:
+                    extra_close_completed = self.advance_forward_by_distance(
+                        self.fall_approach_extra_close_distance,
+                        speed=self.fall_approach_extra_close_speed,
+                        timeout=self.fall_approach_extra_close_timeout,
+                        label="owner",
+                    )
+                if normalized_action in self.fall_assist_arm_action_labels:
+                    self.perform_fall_assist_arm_motion()
+                elif normalized_action in ("lying", "sitting") and extra_close_completed:
+                    self.wait_for_electrical_switch_instruction()
             else:
-                reason = self.last_approach_failure_reason
-                if approached:
-                    rospy.loginfo("Owner approached without arm assist for action=%s", normalized_action)
-                else:
-                    rospy.logwarn("Owner blind approach did not complete for action=%s: %s", normalized_action, reason)
+                rospy.logwarn("Owner blind approach did not complete for action=%s: %s", normalized_action, self.last_approach_failure_reason)
         elif normalized_action == "waving":
             approached = self.approach_waving_owner(owner_candidate)
             if approached:

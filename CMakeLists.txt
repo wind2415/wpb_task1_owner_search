@@ -20,6 +20,7 @@ catkin_package(
 )
 
 catkin_install_python(PROGRAMS
+  scripts/robot_mic_test.py
   scripts/task1_find_owner_real.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

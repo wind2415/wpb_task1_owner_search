@@ -16,6 +16,7 @@ real hardware bringup
   -> if the owner is waving, approach with Kinect point cloud and ask for help
   -> if the owner is lying, split floor fall vs sofa/bed/chair lying by point-cloud height
   -> approach fallen/lying/sitting owners by odometry; run the arm assist only for falls
+  -> after normal sitting/elevated lying approach, listen for and report an electrical-switch command
 ```
 
 Not included yet:
@@ -33,12 +34,12 @@ The launch file starts the same core drivers used by the WPB Home examples:
 - `/dev/rplidar` through `rplidar_ros`, filtered to `/scan`
 - `kinect2_bridge` for `/kinect2/qhd/image_color_rect`
 - `jie_ware/lidar_loc` localization, `move_base`, and `wpbh_local_planner`
-- Offline voice bridge with PiperTTS on `/voice/say`, faster-whisper ASR on `/voice/asr_text`, and `sound_play` playback
+- Offline voice bridge with PiperTTS on `/voice/say` and `sound_play` playback; the switch-command step uses task-local direct ASR by default
 - `yoloworld_perception` on `cuda:0`, with YOLO bounding-box debug image on `/perception/yoloworld/debug_image`
 
 The task node waits for `/kinect2/qhd/image_color_rect`, `/scan`, and `/odom` before it starts moving. This is intentional for real robot safety.
 
-Speech is routed through `offline_voice_bridge`, not the xfyun stack. The task publishes text to `/voice/say`; `offline_tts_node.py` uses PiperTTS to generate a wav and `sound_play` plays it through the audio device on the machine running the launch file. The same launch also starts `offline_asr_node.py`, which uses faster-whisper and publishes recognized text on `/voice/asr_text` while keeping the legacy `/xfyun/iat` output available.
+Speech output is routed through `offline_voice_bridge`, not the xfyun stack. The task publishes text to `/voice/say`; `offline_tts_node.py` uses PiperTTS to generate a wav and `sound_play` plays it through the audio device on the machine running the launch file. Background `offline_asr_node.py` is disabled by default in this task launch so it does not occupy the microphone; the switch-command step records and recognizes its own 5-second audio windows inside `task1_find_owner_real.py`. You can still pass `start_asr:=true` when you specifically want to debug the shared `/voice/asr_text` topic.
 
 ## Files To Prepare
 
@@ -106,6 +107,28 @@ cd ~/catkin_ws
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 roslaunch wpb_task1_owner_search task1_owner_search_task_only.launch
+```
+
+The recommended two-terminal flow starts TTS/sound playback in
+`task1_owner_search_bringup.launch`; background ASR is disabled by default
+because the task records the switch instruction directly after saying
+`请指示。`. If only `task_only` is running, start its voice chain explicitly:
+
+```bash
+roslaunch wpb_task1_owner_search task1_owner_search_task_only.launch start_voice:=true
+```
+
+If you explicitly want to debug the shared `/voice/asr_text` topic, add
+`start_asr:=true`. The task's switch-command path does not require it in the
+default `direct_asr` mode.
+
+The launch defaults the ASR microphone to the ALSA `default` capture device,
+which matches the `wpb_home` voice stack. Check the actual device on the robot
+with `arecord -l`; if the default route is wrong, pass for example:
+
+```bash
+roslaunch wpb_task1_owner_search task1_owner_search_real.launch \
+  asr_capture_device:=plughw:CARD=YourCard,DEV=0
 ```
 
 If the robot is already at the living room and you only want to test owner search and action recognition:
@@ -189,9 +212,13 @@ When the detected action is `waving`, the real robot does not use simulation-onl
 
 The waving approach defaults to a 25-second window and a 0.18 m/s maximum forward speed. To avoid stop-and-go motion, short point-cloud or detection dropouts reuse the last valid motion command with a smooth decay instead of immediately stopping. If it cannot finish, the node logs the concrete reason, such as missing point cloud, too few valid ROI points, large bearing error, lidar guard blocking, or timeout before reaching the target distance.
 
-When the detected action is `falling`, the robot announces `识别到主人摔倒。`, snapshots the owner's 3D position, approaches by odometry, and then runs the arm assist motion. If the final pose is only classified as static `lying`, the robot first samples Kinect point-cloud surface height inside the owner box: low surfaces are treated as `lying_ground` and handled the same as a fall, while elevated surfaces are treated as sofa/bed/chair lying and announced as `识别到主人躺下。`.
+When the detected action is `falling`, the robot announces `识别到主人摔倒。`, snapshots the owner's 3D position, approaches by odometry, then advances a short extra distance, and finally runs the arm assist motion. If the final pose is only classified as static `lying`, the robot first samples Kinect point-cloud surface height inside the owner box: low surfaces are treated as `lying_ground` and handled the same as a fall, while elevated surfaces are treated as sofa/bed/chair lying and announced as `识别到主人躺下。`.
 
-Fall, non-fall lying, and sitting states use the same blind approach mode: the robot records a single relative 3D target, turns toward that bearing using `/odom`, then drives the measured distance by wheel odometry without requiring repeated 2D owner detections. `/scan` remains active as a forward safety guard. After reaching a sitting owner or sofa/bed/chair lying owner, the robot does not extend the arm; after reaching a fall or floor-lying case, it publishes the simulated assist sequence on `/wpb_home/mani_ctrl`: extend with `name=['lift','gripper']`, hold briefly, then retract.
+Fall, non-fall lying, and sitting states use the same blind approach mode: the robot records a single relative 3D target, turns toward that bearing using `/odom`, then drives the measured distance by wheel odometry without requiring repeated 2D owner detections. `/scan` remains active as a forward safety guard. After that it can add a small extra forward nudge so it sits closer to the owner. Only fall and floor-lying cases extend the arm on `/wpb_home/mani_ctrl`: extend with `name=['lift','gripper']`, hold briefly, then retract.
+
+After the robot completes the approach and extra forward nudge for a normal `sitting` or elevated `lying` owner, it says `请指示。` and then runs an independent direct-ASR switch-command loop. In the default `direct_asr` mode, the task node itself records 5 seconds from the ALSA microphone, writes a temporary wav under `/dev/shm`, transcribes it with the local faster-whisper Chinese model, and classifies the transcript with the local Ollama endpoint (`qwen3.5:2b`) using the same JSON contract as `offline_voice_bridge/tools/local_switch_command_test.py`; if Ollama is unavailable, the task uses conservative keyword fallback. If a 5-second window has no recognized speech text, the task starts the next 5-second window instead of immediately giving up. The result is recorded as `on`, `off`, or `unknown` and published latched on `/electrical_switch/state`, followed by the corresponding fixed voice response. Fall and floor-lying (`lying_ground`) paths do not enter this interaction and retain the arm-assist behavior. This package currently records and publishes the requested state; it does not actuate physical switch hardware because no switch-driver topic/service is defined here.
+
+The default `electrical_switch_instruction_timeout: 0.0` means there is no total timeout for the repeated 5-second instruction windows. Set `electrical_switch_instruction_max_empty_windows` or a positive `electrical_switch_instruction_timeout` if testing needs a hard stop.
 
 ## Useful Checks
 
@@ -207,6 +234,7 @@ rostopic hz /perception/yoloworld/debug_image
 watch -n 1 nvidia-smi
 rostopic info /voice/say
 rostopic info /voice/asr_text
+rostopic echo /electrical_switch/state
 ```
 
 ## Troubleshooting Repeated Runs
@@ -233,6 +261,36 @@ Quick speech test:
 
 ```bash
 rostopic pub -1 /voice/say std_msgs/String "data: '我已经识别到主人。'"
+```
+
+Raw robot microphone and Chinese ASR test:
+
+```bash
+rosrun wpb_task1_owner_search robot_mic_test.py --list-devices --seconds 12
+```
+
+The test first loads the local faster-whisper Chinese model, then captures
+audio in 4-second windows. Speak near the robot after the command starts. If
+the microphone is receiving audio, the printed RMS value should jump and lines
+should show `VOICE`; each active window also prints `识别文本`. To test only
+the microphone level without loading ASR:
+
+```bash
+rosrun wpb_task1_owner_search robot_mic_test.py --no-asr --seconds 10
+```
+
+To save the captured audio for playback:
+
+```bash
+rosrun wpb_task1_owner_search robot_mic_test.py --seconds 10 --save-wav /tmp/robot_mic_test.wav
+aplay /tmp/robot_mic_test.wav
+```
+
+If `default` does not work but `arecord -l` shows another capture card, pass it
+explicitly:
+
+```bash
+rosrun wpb_task1_owner_search robot_mic_test.py --device plughw:CARD=Generic_1,DEV=0 --seconds 10
 ```
 
 Expected task completion log:
