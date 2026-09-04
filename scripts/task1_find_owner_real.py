@@ -5,7 +5,9 @@ import audioop
 import json
 import os
 import re
+import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -18,6 +20,10 @@ import cv2
 import numpy as np
 import rospy
 import sensor_msgs.point_cloud2 as pc2
+try:
+    import tf
+except ImportError:
+    tf = None
 from actionlib_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Twist
@@ -64,6 +70,7 @@ class RealOwnerSearchBeforeAction:
         self.latest_pointcloud_time = None
         self.latest_yaw = None
         self.latest_odom_xy = None
+        self.latest_odom_linear_speed = None
         self.latest_odom_time = None
         self.owner_track_center = None
         self.last_pointcloud_reason = ""
@@ -165,6 +172,20 @@ class RealOwnerSearchBeforeAction:
         self.action_roi_padding = float(rospy.get_param("~action_roi_padding", 0.35))
         self.action_min_pose_samples = int(rospy.get_param("~action_min_pose_samples", 5))
         self.action_static_required_ratio = float(rospy.get_param("~action_static_required_ratio", 0.65))
+        self.action_sitting_min_torso_verticality = float(
+            rospy.get_param("~action_sitting_min_torso_verticality", 0.45)
+        )
+        self.action_sitting_knee_angle_max = float(rospy.get_param("~action_sitting_knee_angle_max", 150.0))
+        self.action_sitting_knee_hip_y_ratio = float(rospy.get_param("~action_sitting_knee_hip_y_ratio", 0.45))
+        self.action_sitting_ankle_hip_y_ratio = float(rospy.get_param("~action_sitting_ankle_hip_y_ratio", 0.62))
+        self.action_sitting_thigh_horizontal_ratio = float(
+            rospy.get_param("~action_sitting_thigh_horizontal_ratio", 0.65)
+        )
+        self.action_sitting_compact_aspect_min = float(
+            rospy.get_param("~action_sitting_compact_aspect_min", 0.55)
+        )
+        self.action_sitting_support_score = float(rospy.get_param("~action_sitting_support_score", 0.75))
+        self.action_sitting_relaxed_ratio = float(rospy.get_param("~action_sitting_relaxed_ratio", 0.50))
         self.action_fall_center_drop = float(rospy.get_param("~action_fall_center_drop", 0.06))
         self.action_fall_torso_drop = float(rospy.get_param("~action_fall_torso_drop", 0.20))
         self.action_fall_aspect_gain = float(rospy.get_param("~action_fall_aspect_gain", 0.25))
@@ -188,9 +209,12 @@ class RealOwnerSearchBeforeAction:
         self.approach_linear_speed = abs(float(rospy.get_param("~approach_linear_speed", 0.18)))
         self.approach_angular_gain = float(rospy.get_param("~approach_angular_gain", 0.45))
         self.approach_max_angular_speed = abs(float(rospy.get_param("~approach_max_angular_speed", 0.25)))
-        self.approach_stop_distance = float(rospy.get_param("~approach_stop_distance", 0.70))
+        self.approach_stop_distance = float(rospy.get_param("~approach_stop_distance", 0.45))
         self.approach_standoff_distance = float(rospy.get_param("~approach_standoff_distance", self.approach_stop_distance))
-        self.approach_distance_tolerance = float(rospy.get_param("~approach_distance_tolerance", 0.08))
+        self.approach_distance_tolerance = float(rospy.get_param("~approach_distance_tolerance", 0.05))
+        self.approach_fast_finish_tolerance = float(
+            rospy.get_param("~approach_fast_finish_tolerance", self.approach_distance_tolerance)
+        )
         self.approach_bearing_tolerance = float(rospy.get_param("~approach_bearing_tolerance", 0.06))
         self.approach_forward_bearing_limit = float(rospy.get_param("~approach_forward_bearing_limit", 0.45))
         self.approach_arrival_stable_cycles = max(1, int(rospy.get_param("~approach_arrival_stable_cycles", 1)))
@@ -200,7 +224,7 @@ class RealOwnerSearchBeforeAction:
         self.approach_center_tolerance = float(rospy.get_param("~approach_center_tolerance", 0.12))
         self.approach_target_height_ratio = float(rospy.get_param("~approach_target_height_ratio", 0.55))
         self.approach_lost_turn_speed = abs(float(rospy.get_param("~approach_lost_turn_speed", 0.10)))
-        self.approach_front_scan_degrees = float(rospy.get_param("~approach_front_scan_degrees", 12.0))
+        self.approach_front_scan_degrees = float(rospy.get_param("~approach_front_scan_degrees", 25.0))
         self.approach_scan_max_age = float(rospy.get_param("~approach_scan_max_age", 0.8))
         self.approach_require_lidar = bool(rospy.get_param("~approach_require_lidar", False))
         self.approach_lidar_stop_distance = float(rospy.get_param("~approach_lidar_stop_distance", 0.55))
@@ -218,6 +242,53 @@ class RealOwnerSearchBeforeAction:
         self.approach_max_depth = float(rospy.get_param("~approach_max_depth", 5.0))
         self.approach_linear_gain = float(rospy.get_param("~approach_linear_gain", 0.25))
         self.approach_min_linear_speed = abs(float(rospy.get_param("~approach_min_linear_speed", 0.06)))
+        self.approach_slow_finish_enabled = bool(rospy.get_param("~approach_slow_finish_enabled", True))
+        self.approach_slow_finish_tolerance = max(
+            0.0,
+            float(rospy.get_param("~approach_slow_finish_tolerance", 0.05)),
+        )
+        self.approach_slow_finish_linear_speed = abs(
+            float(rospy.get_param("~approach_slow_finish_linear_speed", 0.03))
+        )
+        self.approach_slow_finish_cycles = max(1, int(rospy.get_param("~approach_slow_finish_cycles", 3)))
+        self.approach_odom_speed_max_age = max(0.1, float(rospy.get_param("~approach_odom_speed_max_age", 0.6)))
+        self.approach_navigation_enabled = bool(rospy.get_param("~approach_navigation_enabled", True))
+        self.approach_navigation_frame = rospy.get_param("~approach_navigation_frame", "map")
+        self.approach_navigation_base_frame = rospy.get_param("~approach_navigation_base_frame", "base_footprint")
+        if self.approach_navigation_frame in ("base_footprint", "base_link"):
+            rospy.logwarn(
+                "approach_navigation_frame=%s is a robot frame and will be rejected by move_base; using map as the goal frame and %s as the base frame",
+                self.approach_navigation_frame,
+                self.approach_navigation_frame,
+            )
+            self.approach_navigation_base_frame = self.approach_navigation_frame
+            self.approach_navigation_frame = "map"
+        self.approach_navigation_tf_timeout = float(rospy.get_param("~approach_navigation_tf_timeout", 0.6))
+        self.approach_navigation_timeout = float(rospy.get_param("~approach_navigation_timeout", 18.0))
+        self.approach_navigation_server_timeout = float(rospy.get_param("~approach_navigation_server_timeout", 3.0))
+        self.approach_navigation_retry_after_clear = bool(
+            rospy.get_param("~approach_navigation_retry_after_clear", True)
+        )
+        self.approach_navigation_clear_costmaps_before_goal = bool(
+            rospy.get_param("~approach_navigation_clear_costmaps_before_goal", False)
+        )
+        self.approach_navigation_min_distance = max(
+            0.0,
+            float(rospy.get_param("~approach_navigation_min_distance", 0.05)),
+        )
+        self.approach_navigation_lidar_guard_enabled = bool(
+            rospy.get_param("~approach_navigation_lidar_guard_enabled", False)
+        )
+        self.approach_navigation_stuck_timeout = float(
+            rospy.get_param("~approach_navigation_stuck_timeout", 4.0)
+        )
+        self.approach_navigation_stuck_min_progress = float(
+            rospy.get_param("~approach_navigation_stuck_min_progress", 0.05)
+        )
+        self.approach_navigation_stuck_linear_speed = abs(
+            float(rospy.get_param("~approach_navigation_stuck_linear_speed", 0.025))
+        )
+        self.approach_direct_fallback_enabled = bool(rospy.get_param("~approach_direct_fallback_enabled", False))
         self.approach_help_prompt = rospy.get_param("~approach_help_prompt", "请问您需要什么帮助？")
 
         self.fall_approach_enabled = bool(rospy.get_param("~fall_approach_enabled", True))
@@ -231,6 +302,9 @@ class RealOwnerSearchBeforeAction:
         )
         self.fall_approach_standoff_distance = float(rospy.get_param("~fall_approach_standoff_distance", 0.75))
         self.fall_approach_distance_tolerance = float(rospy.get_param("~fall_approach_distance_tolerance", 0.08))
+        self.fall_approach_fast_finish_tolerance = float(
+            rospy.get_param("~fall_approach_fast_finish_tolerance", self.fall_approach_distance_tolerance)
+        )
         self.fall_approach_linear_speed = abs(float(rospy.get_param("~fall_approach_linear_speed", 0.14)))
         self.fall_approach_min_linear_speed = abs(float(rospy.get_param("~fall_approach_min_linear_speed", 0.05)))
         self.fall_approach_linear_gain = float(rospy.get_param("~fall_approach_linear_gain", self.approach_linear_gain))
@@ -245,6 +319,9 @@ class RealOwnerSearchBeforeAction:
         self.fall_approach_extra_close_distance = float(rospy.get_param("~fall_approach_extra_close_distance", 0.18))
         self.fall_approach_extra_close_speed = abs(float(rospy.get_param("~fall_approach_extra_close_speed", 0.08)))
         self.fall_approach_extra_close_timeout = float(rospy.get_param("~fall_approach_extra_close_timeout", 6.0))
+        self.fall_approach_extra_close_finish_tolerance = float(
+            rospy.get_param("~fall_approach_extra_close_finish_tolerance", 0.05)
+        )
 
         self.fall_assist_arm_enabled = bool(rospy.get_param("~fall_assist_arm_enabled", True))
         self.fall_assist_arm_action_labels = self.parse_string_list(
@@ -282,8 +359,51 @@ class RealOwnerSearchBeforeAction:
         )
         self.electrical_switch_prompt = rospy.get_param("~electrical_switch_prompt", "请指示。")
         self.electrical_switch_prompt_hold = float(rospy.get_param("~electrical_switch_prompt_hold", 1.5))
+        self.electrical_switch_ready_ding_enabled = bool(
+            rospy.get_param("~electrical_switch_ready_ding_enabled", True)
+        )
+        self.electrical_switch_ready_ding_wav = os.path.expanduser(
+            rospy.get_param("~electrical_switch_ready_ding_wav", "/dev/shm/task1_switch_ready_ding.wav")
+        )
+        self.electrical_switch_ready_ding_frequency = float(
+            rospy.get_param("~electrical_switch_ready_ding_frequency", 880.0)
+        )
+        self.electrical_switch_ready_ding_duration = float(
+            rospy.get_param("~electrical_switch_ready_ding_duration", 0.16)
+        )
+        self.electrical_switch_ready_ding_volume = float(
+            rospy.get_param("~electrical_switch_ready_ding_volume", 0.65)
+        )
+        self.electrical_switch_pause_yolo_during_voice = bool(
+            rospy.get_param("~electrical_switch_pause_yolo_during_voice", True)
+        )
+        self.electrical_switch_pause_yolo_settle_seconds = float(
+            rospy.get_param("~electrical_switch_pause_yolo_settle_seconds", 0.15)
+        )
+        self.electrical_switch_script_filter_output = bool(
+            rospy.get_param("~electrical_switch_script_filter_output", True)
+        )
+        self.electrical_switch_script_output_pattern = str(
+            rospy.get_param(
+                "~electrical_switch_script_output_pattern",
+                r"(模型|预加载|开始测试|第\s*\d+\s*轮|录音|RMS|识别文本|判断结果|没有识别|没有听出|LLM|ASR|TTS|播报|提示音|ERROR|WARN)",
+            )
+        )
+        self.electrical_switch_ready_ding_player = str(
+            rospy.get_param("~electrical_switch_ready_ding_player", "aplay")
+        ).strip()
+        self.electrical_switch_ready_ding_speaker_device = str(
+            rospy.get_param("~electrical_switch_ready_ding_speaker_device", "default")
+        ).strip()
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        task_package_dir = os.path.abspath(os.path.join(script_dir, ".."))
+        self.task_package_dir = task_package_dir
         catkin_src_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
+        default_switch_script_path = os.path.join(
+            task_package_dir,
+            "tools",
+            "local_switch_command_test.py",
+        )
         default_switch_asr_model = os.path.join(
             catkin_src_dir,
             "offline_voice_bridge",
@@ -291,8 +411,20 @@ class RealOwnerSearchBeforeAction:
             "whisper",
             "faster-whisper-small",
         )
+        self.electrical_switch_script_path = os.path.expanduser(
+            rospy.get_param("~electrical_switch_script_path", default_switch_script_path)
+        )
+        self.electrical_switch_script_python = str(
+            rospy.get_param("~electrical_switch_script_python", "python3")
+        ).strip() or "python3"
+        self.electrical_switch_script_until_result = bool(
+            rospy.get_param("~electrical_switch_script_until_result", True)
+        )
         self.electrical_switch_asr_capture_device = rospy.get_param(
             "~electrical_switch_asr_capture_device", rospy.get_param("/asr/capture_device", "default")
+        )
+        self.electrical_switch_asr_energy_threshold = int(
+            rospy.get_param("~electrical_switch_asr_energy_threshold", rospy.get_param("/asr/energy_threshold", 300))
         )
         self.electrical_switch_asr_sample_rate = int(rospy.get_param("~electrical_switch_asr_sample_rate", 16000))
         self.electrical_switch_asr_channels = int(rospy.get_param("~electrical_switch_asr_channels", 1))
@@ -315,8 +447,23 @@ class RealOwnerSearchBeforeAction:
         self.electrical_switch_ollama_url = rospy.get_param(
             "~electrical_switch_ollama_url", "http://127.0.0.1:11434/api/chat"
         )
+        self.electrical_switch_ollama_enabled = bool(
+            rospy.get_param("~electrical_switch_ollama_enabled", True)
+        )
         self.electrical_switch_ollama_model = rospy.get_param(
             "~electrical_switch_ollama_model", "qwen3.5:2b"
+        )
+        self.electrical_switch_ollama_autoselect_model = bool(
+            rospy.get_param("~electrical_switch_ollama_autoselect_model", True)
+        )
+        self.electrical_switch_ollama_model_fallbacks = self.parse_string_list(
+            rospy.get_param("~electrical_switch_ollama_model_fallbacks", [])
+        )
+        self.electrical_switch_ollama_tags_timeout = float(
+            rospy.get_param("~electrical_switch_ollama_tags_timeout", 2.0)
+        )
+        self.electrical_switch_ollama_num_gpu = int(
+            rospy.get_param("~electrical_switch_ollama_num_gpu", 0)
         )
         self.electrical_switch_ollama_timeout = float(
             rospy.get_param("~electrical_switch_ollama_timeout", 30.0)
@@ -326,6 +473,39 @@ class RealOwnerSearchBeforeAction:
         )
         self.electrical_switch_ollama_max_tokens = max(
             8, int(rospy.get_param("~electrical_switch_ollama_max_tokens", 20))
+        )
+        self.electrical_switch_ollama_warmup_enabled = bool(
+            rospy.get_param("~electrical_switch_ollama_warmup_enabled", True)
+        )
+        self.electrical_switch_ollama_warmup_timeout = float(
+            rospy.get_param(
+                "~electrical_switch_ollama_warmup_timeout",
+                max(15.0, self.electrical_switch_ollama_timeout),
+            )
+        )
+        self.electrical_switch_ollama_warmup_retries = max(
+            1, int(rospy.get_param("~electrical_switch_ollama_warmup_retries", 3))
+        )
+        self.electrical_switch_ollama_warmup_retry_delay = float(
+            rospy.get_param("~electrical_switch_ollama_warmup_retry_delay", 5.0)
+        )
+        self.electrical_switch_ollama_failure_cooldown = float(
+            rospy.get_param("~electrical_switch_ollama_failure_cooldown", 60.0)
+        )
+        self.electrical_switch_fast_keyword_first = bool(
+            rospy.get_param("~electrical_switch_fast_keyword_first", True)
+        )
+        self.electrical_switch_preload_enabled = bool(
+            rospy.get_param("~electrical_switch_preload_enabled", True)
+        )
+        self.electrical_switch_preload_wait_before_prompt = bool(
+            rospy.get_param("~electrical_switch_preload_wait_before_prompt", True)
+        )
+        self.electrical_switch_preload_wait_timeout = float(
+            rospy.get_param("~electrical_switch_preload_wait_timeout", 20.0)
+        )
+        self.electrical_switch_asr_transcribe_from_memory = bool(
+            rospy.get_param("~electrical_switch_asr_transcribe_from_memory", True)
         )
         self.electrical_switch_reply_on = rospy.get_param(
             "~electrical_switch_reply_on", "好的，已开启电气开关。"
@@ -342,6 +522,13 @@ class RealOwnerSearchBeforeAction:
         self.asr_history = []
         self.electrical_switch_asr_model = None
         self.electrical_switch_asr_ready = False
+        self.electrical_switch_asr_lock = threading.Lock()
+        self.electrical_switch_ollama_lock = threading.Lock()
+        self.electrical_switch_ollama_available = None
+        self.electrical_switch_ollama_last_failure = 0.0
+        self.electrical_switch_preload_done = threading.Event()
+        self.electrical_switch_preload_started = False
+        self.electrical_switch_preload_thread = None
         self.electrical_switch_state = "unknown"
 
         self.speak_on_start = bool(rospy.get_param("~speak_on_start", True))
@@ -378,8 +565,10 @@ class RealOwnerSearchBeforeAction:
         self.asr_sub = rospy.Subscriber(self.asr_topic, String, self.asr_callback, queue_size=10)
 
         self.publish_electrical_switch_state()
+        self.start_electrical_switch_preload()
 
         self.move_base = actionlib.SimpleActionClient("move_base", MoveBaseAction)
+        self.tf_listener = tf.TransformListener() if tf is not None else None
 
         if self.face_verify_enabled:
             self.owner_reference_images = self.load_owner_images()
@@ -819,10 +1008,52 @@ class RealOwnerSearchBeforeAction:
         lying_like = (torso_v < 0.42) or (posture_aspect > 1.20 and torso_v < 0.68)
 
         knees_near_hips = False
+        any_knee_near_hip = False
         if hip_mid is not None and knee_mid is not None:
-            knees_near_hips = abs(knee_mid[1] - hip_mid[1]) < box_h * 0.45
-        bent_knee = knee_angle is not None and knee_angle < 150.0
-        sitting_like = torso_v > 0.45 and (bent_knee or knees_near_hips) and not lying_like
+            knees_near_hips = abs(knee_mid[1] - hip_mid[1]) < box_h * self.action_sitting_knee_hip_y_ratio
+
+        thigh_horizontal = False
+        ankle_near_hip = False
+        for hip, knee, ankle in ((left_hip, left_knee, left_ankle), (right_hip, right_knee, right_ankle)):
+            if hip is not None and knee is not None:
+                thigh_dx = abs(knee[0] - hip[0])
+                thigh_dy = abs(knee[1] - hip[1])
+                thigh_len = math.hypot(thigh_dx, thigh_dy)
+                if thigh_dy < box_h * self.action_sitting_knee_hip_y_ratio:
+                    any_knee_near_hip = True
+                if (
+                    thigh_len > box_h * 0.08
+                    and thigh_dx > thigh_dy * self.action_sitting_thigh_horizontal_ratio
+                ):
+                    thigh_horizontal = True
+            if hip is not None and ankle is not None:
+                if abs(ankle[1] - hip[1]) < box_h * self.action_sitting_ankle_hip_y_ratio:
+                    ankle_near_hip = True
+
+        bent_knee = knee_angle is not None and knee_angle < self.action_sitting_knee_angle_max
+        compact_seated_box = (
+            posture_aspect >= self.action_sitting_compact_aspect_min
+            and posture_aspect <= 1.20
+            and torso_v < 0.97
+        )
+        sitting_score = 0.0
+        if bent_knee:
+            sitting_score += 1.0
+        if knees_near_hips:
+            sitting_score += 1.0
+        elif any_knee_near_hip:
+            sitting_score += 0.75
+        if thigh_horizontal:
+            sitting_score += 0.55
+        if ankle_near_hip:
+            sitting_score += 0.45
+        if compact_seated_box:
+            sitting_score += 0.25
+
+        sitting_min_torso = self.action_sitting_min_torso_verticality
+        sitting_support_threshold = self.action_sitting_support_score
+        sitting_support_like = torso_v > sitting_min_torso and sitting_score >= sitting_support_threshold and not lying_like
+        sitting_like = torso_v > sitting_min_torso and sitting_score >= 1.0 and not lying_like
         upright_like = torso_v > 0.65 and posture_aspect < 1.05
 
         return {
@@ -838,6 +1069,12 @@ class RealOwnerSearchBeforeAction:
             "left_wrist_x_norm": left_wrist_x_norm,
             "right_wrist_x_norm": right_wrist_x_norm,
             "lying_like": lying_like,
+            "any_knee_near_hip": any_knee_near_hip,
+            "thigh_horizontal": thigh_horizontal,
+            "ankle_near_hip": ankle_near_hip,
+            "compact_seated_box": compact_seated_box,
+            "sitting_score": sitting_score,
+            "sitting_support_like": sitting_support_like,
             "sitting_like": sitting_like,
             "upright_like": upright_like,
             "box_conf": pose["box_conf"],
@@ -942,6 +1179,28 @@ class RealOwnerSearchBeforeAction:
             )
             return "falling", confidence, "fall transition"
 
+        lie_ratio = sum(1 for feature in usable if feature["lying_like"]) / sample_count
+        sit_ratio = sum(1 for feature in usable if feature["sitting_like"]) / sample_count
+        sit_support_ratio = sum(1 for feature in usable if feature.get("sitting_support_like")) / sample_count
+        median_sitting_score = self.median_value([feature.get("sitting_score") for feature in usable])
+        required_ratio = clamp(self.action_static_required_ratio, 0.50, 0.95)
+        sitting_relaxed_ratio = clamp(self.action_sitting_relaxed_ratio, 0.35, required_ratio)
+        sitting_support_score = max(0.0, self.action_sitting_support_score)
+        rospy.loginfo(
+            "Owner action feature summary: samples=%d lie_ratio=%.2f sit_ratio=%.2f sit_support=%.2f "
+            "aspect=%s torso=%s knee=%s sit_score=%s",
+            len(usable),
+            lie_ratio,
+            sit_ratio,
+            sit_support_ratio,
+            "%.2f" % median_aspect if median_aspect is not None else "NA",
+            "%.2f" % median_torso if median_torso is not None else "NA",
+            "%.0f" % median_knee if median_knee is not None else "NA",
+            "%.2f" % median_sitting_score if median_sitting_score is not None else "NA",
+        )
+        if lie_ratio >= required_ratio and (median_aspect is None or median_aspect > 1.05):
+            return "lying", clamp(0.50 + lie_ratio * 0.45, 0.0, 0.95), "horizontal body posture"
+
         wave_scores = []
         for side in ("left", "right"):
             above_key = "%s_wrist_above" % side
@@ -955,22 +1214,22 @@ class RealOwnerSearchBeforeAction:
         if wave_scores:
             return "waving", max(wave_scores), "raised wrist motion"
 
-        lie_ratio = sum(1 for feature in usable if feature["lying_like"]) / sample_count
-        sit_ratio = sum(1 for feature in usable if feature["sitting_like"]) / sample_count
-        required_ratio = clamp(self.action_static_required_ratio, 0.50, 0.95)
-        rospy.loginfo(
-            "Owner action feature summary: samples=%d lie_ratio=%.2f sit_ratio=%.2f aspect=%s torso=%s knee=%s",
-            len(usable),
-            lie_ratio,
-            sit_ratio,
-            "%.2f" % median_aspect if median_aspect is not None else "NA",
-            "%.2f" % median_torso if median_torso is not None else "NA",
-            "%.0f" % median_knee if median_knee is not None else "NA",
-        )
-        if lie_ratio >= required_ratio and (median_aspect is None or median_aspect > 1.05):
-            return "lying", clamp(0.50 + lie_ratio * 0.45, 0.0, 0.95), "horizontal body posture"
-        if sit_ratio >= required_ratio and median_torso is not None and median_torso > 0.45:
+        if sit_ratio >= required_ratio and median_torso is not None and median_torso > self.action_sitting_min_torso_verticality:
             return "sitting", clamp(0.50 + sit_ratio * 0.45, 0.0, 0.95), "bent seated posture"
+        if (
+            lie_ratio < required_ratio
+            and median_torso is not None
+            and median_torso > self.action_sitting_min_torso_verticality
+            and median_sitting_score is not None
+            and median_sitting_score >= sitting_support_score
+            and (sit_support_ratio >= required_ratio or sit_ratio >= sitting_relaxed_ratio)
+        ):
+            confidence = clamp(
+                0.46 + max(sit_ratio, sit_support_ratio) * 0.38 + min(1.5, median_sitting_score) * 0.06,
+                0.0,
+                0.92,
+            )
+            return "sitting", confidence, "supported seated posture"
 
         upright_ratio = sum(1 for feature in usable if feature["upright_like"]) / sample_count
         if self.action_report_standing and upright_ratio >= required_ratio:
@@ -1064,9 +1323,11 @@ class RealOwnerSearchBeforeAction:
     def odom_callback(self, msg):
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         position = msg.pose.pose.position
+        linear = msg.twist.twist.linear
         with self.lock:
             self.latest_yaw = yaw
             self.latest_odom_xy = (float(position.x), float(position.y))
+            self.latest_odom_linear_speed = math.hypot(float(linear.x), float(linear.y))
             self.latest_odom_time = time.time()
 
     def asr_callback(self, msg):
@@ -1105,44 +1366,306 @@ class RealOwnerSearchBeforeAction:
             wav_file.setframerate(int(sample_rate))
             wav_file.writeframes(raw_audio)
 
+    def ensure_electrical_switch_ready_ding_wav(self):
+        wav_path = self.electrical_switch_ready_ding_wav
+        sample_rate = 16000
+        duration = max(0.03, float(self.electrical_switch_ready_ding_duration))
+        frequency = max(100.0, float(self.electrical_switch_ready_ding_frequency))
+        volume = clamp(float(self.electrical_switch_ready_ding_volume), 0.0, 1.0)
+        frame_count = max(1, int(sample_rate * duration))
+        attack_frames = max(1, int(sample_rate * 0.01))
+        release_frames = max(1, int(sample_rate * 0.04))
+        amplitude = int(32767 * volume)
+        frames = bytearray()
+
+        for index in range(frame_count):
+            attack = min(1.0, float(index + 1) / attack_frames)
+            release = min(1.0, float(frame_count - index) / release_frames)
+            envelope = min(attack, release)
+            sample = int(amplitude * envelope * math.sin(2.0 * math.pi * frequency * index / sample_rate))
+            frames.extend(struct.pack("<h", sample))
+
+        try:
+            out_dir = os.path.dirname(wav_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            self.write_pcm_wav(wav_path, bytes(frames), sample_rate, 1)
+            return wav_path
+        except Exception as exc:
+            rospy.logwarn("Failed to create electrical switch ready ding wav: %s", exc)
+            return ""
+
+    def play_electrical_switch_ready_ding(self):
+        if not self.electrical_switch_ready_ding_enabled:
+            return
+        player = self.electrical_switch_ready_ding_player
+        if not player:
+            return
+
+        wav_path = self.ensure_electrical_switch_ready_ding_wav()
+        if not wav_path:
+            return
+
+        cmd = [player, "-q"]
+        if self.electrical_switch_ready_ding_speaker_device and os.path.basename(player) == "aplay":
+            cmd.extend(["-D", self.electrical_switch_ready_ding_speaker_device])
+        cmd.append(wav_path)
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=max(1.0, float(self.electrical_switch_ready_ding_duration) + 2.0),
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+                rospy.logwarn("Electrical switch ready ding playback failed: %s", stderr or proc.returncode)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rospy.logwarn("Unable to play electrical switch ready ding: %s", exc)
+
+    def start_electrical_switch_preload(self):
+        if not self.electrical_switch_preload_enabled or self.electrical_switch_preload_started:
+            return
+        self.electrical_switch_preload_started = True
+        self.electrical_switch_preload_thread = threading.Thread(
+            target=self.preload_electrical_switch_voice_stack,
+            name="electrical_switch_voice_preload",
+        )
+        self.electrical_switch_preload_thread.daemon = True
+        self.electrical_switch_preload_thread.start()
+
+    def preload_electrical_switch_voice_stack(self):
+        rospy.loginfo("Preloading electrical switch voice stack in background")
+        try:
+            if self.electrical_switch_instruction_source in (
+                "direct",
+                "direct_asr",
+                "mic",
+                "microphone",
+            ):
+                self.ensure_electrical_switch_asr_model()
+            if self.electrical_switch_ollama_warmup_enabled:
+                for attempt in range(self.electrical_switch_ollama_warmup_retries):
+                    if rospy.is_shutdown():
+                        break
+                    if self.warmup_electrical_switch_ollama():
+                        break
+                    if attempt + 1 < self.electrical_switch_ollama_warmup_retries:
+                        rospy.sleep(max(0.0, float(self.electrical_switch_ollama_warmup_retry_delay)))
+        finally:
+            self.electrical_switch_preload_done.set()
+            rospy.loginfo("Electrical switch voice stack preload finished")
+
+    def wait_for_electrical_switch_preload(self):
+        if not self.electrical_switch_preload_enabled:
+            return
+        self.start_electrical_switch_preload()
+        if self.electrical_switch_preload_done.is_set() or not self.electrical_switch_preload_wait_before_prompt:
+            return
+
+        timeout = max(0.0, float(self.electrical_switch_preload_wait_timeout))
+        rospy.loginfo("Waiting up to %.1fs for electrical switch voice preload", timeout)
+        if timeout <= 0.0:
+            self.electrical_switch_preload_done.wait()
+        elif not self.electrical_switch_preload_done.wait(timeout):
+            rospy.logwarn("Electrical switch voice preload is still running; continuing before it finishes")
+
+    def electrical_switch_ollama_tags_url(self):
+        url = str(self.electrical_switch_ollama_url).strip()
+        if re.search(r"/api/(chat|generate)/?$", url):
+            return re.sub(r"/api/(chat|generate)/?$", "/api/tags", url)
+        return url.rstrip("/") + "/api/tags"
+
+    def select_available_electrical_switch_ollama_model(self):
+        if not self.electrical_switch_ollama_autoselect_model:
+            return True
+
+        request = urllib.request.Request(self.electrical_switch_ollama_tags_url(), method="GET")
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=max(0.5, float(self.electrical_switch_ollama_tags_timeout)),
+            ) as response:
+                raw = response.read().decode("utf-8")
+            result = json.loads(raw)
+        except Exception as exc:
+            rospy.logwarn("Unable to list local Ollama models; trying configured model directly: %s", exc)
+            return True
+
+        names = []
+        model_items = result.get("models", []) if isinstance(result, dict) else []
+        for item in model_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                names.append(name)
+        if not names:
+            rospy.logwarn("Ollama returned no local models; skipping LLM for switch command classification")
+            self.electrical_switch_ollama_available = False
+            self.electrical_switch_ollama_last_failure = time.time()
+            return False
+
+        by_lower_name = {name.lower(): name for name in names}
+        candidates = [self.electrical_switch_ollama_model] + list(self.electrical_switch_ollama_model_fallbacks)
+        for candidate in candidates:
+            model_name = by_lower_name.get(str(candidate).strip().lower())
+            if not model_name:
+                continue
+            if model_name != self.electrical_switch_ollama_model:
+                rospy.logwarn(
+                    "Configured Ollama model %s is not local; using available fallback %s",
+                    self.electrical_switch_ollama_model,
+                    model_name,
+                )
+                self.electrical_switch_ollama_model = model_name
+            return True
+
+        rospy.logwarn(
+            "No configured switch-command Ollama model is installed locally; candidates=%s local=%s",
+            ", ".join(str(item) for item in candidates if str(item).strip()),
+            ", ".join(names[:8]),
+        )
+        self.electrical_switch_ollama_available = False
+        self.electrical_switch_ollama_last_failure = time.time()
+        return False
+
+    def warmup_electrical_switch_ollama(self):
+        if not self.electrical_switch_ollama_enabled:
+            self.electrical_switch_ollama_available = False
+            return False
+        with self.electrical_switch_ollama_lock:
+            if self.electrical_switch_ollama_available is True:
+                return True
+            if not self.select_available_electrical_switch_ollama_model():
+                return False
+
+            prompt = (
+                "/no_think\n"
+                "只输出一行 JSON：{\"action\":\"unknown\"}。这是启动预热，不是用户指令。"
+            )
+            payload = {
+                "model": self.electrical_switch_ollama_model,
+                "stream": False,
+                "think": False,
+                "format": "json",
+                "keep_alive": self.electrical_switch_ollama_keep_alive,
+                "messages": [{"role": "user", "content": prompt}],
+                "options": {
+                    "temperature": 0,
+                    "top_p": 0.7,
+                    "num_predict": max(8, self.electrical_switch_ollama_max_tokens),
+                    "num_ctx": 512,
+                    "num_gpu": max(0, self.electrical_switch_ollama_num_gpu),
+                },
+            }
+            request = urllib.request.Request(
+                self.electrical_switch_ollama_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                start = time.time()
+                with urllib.request.urlopen(
+                    request,
+                    timeout=max(1.0, float(self.electrical_switch_ollama_warmup_timeout)),
+                ) as response:
+                    response.read()
+                self.electrical_switch_ollama_available = True
+                rospy.loginfo(
+                    "Electrical switch Ollama model warmed in %.2fs: %s",
+                    time.time() - start,
+                    self.electrical_switch_ollama_model,
+                )
+                return True
+            except Exception as exc:
+                self.electrical_switch_ollama_available = False
+                self.electrical_switch_ollama_last_failure = time.time()
+                rospy.logwarn(
+                    "Electrical switch Ollama warmup failed; keyword fallback will be used first: %s",
+                    exc,
+                )
+                return False
+
+    def should_try_electrical_switch_ollama(self):
+        if not self.electrical_switch_ollama_enabled:
+            return False
+        if (
+            self.electrical_switch_ollama_warmup_enabled
+            and self.electrical_switch_preload_started
+            and not self.electrical_switch_preload_done.is_set()
+            and self.electrical_switch_ollama_available is None
+        ):
+            return False
+        if self.electrical_switch_ollama_available is not False:
+            return True
+        cooldown = max(0.0, float(self.electrical_switch_ollama_failure_cooldown))
+        return time.time() - self.electrical_switch_ollama_last_failure >= cooldown
+
+    def begin_electrical_switch_voice_phase(self):
+        if not self.electrical_switch_pause_yolo_during_voice:
+            return
+        self.set_yolo_paused(True)
+        settle_seconds = max(0.0, float(self.electrical_switch_pause_yolo_settle_seconds))
+        if settle_seconds > 0.0:
+            rospy.sleep(settle_seconds)
+
+    def end_electrical_switch_voice_phase(self):
+        if self.electrical_switch_pause_yolo_during_voice:
+            self.set_yolo_paused(False)
+
+    def should_print_electrical_switch_script_line(self, line):
+        if not self.electrical_switch_script_filter_output:
+            return True
+        try:
+            return re.search(self.electrical_switch_script_output_pattern, line) is not None
+        except re.error:
+            return True
+
     def ensure_electrical_switch_asr_model(self):
         if self.electrical_switch_asr_ready and self.electrical_switch_asr_model is not None:
             return True
 
-        if self.electrical_switch_asr_hf_endpoint:
-            os.environ.setdefault("HF_ENDPOINT", self.electrical_switch_asr_hf_endpoint)
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            rospy.logerr("faster-whisper is not available for direct switch ASR: %s", exc)
-            return False
+        with self.electrical_switch_asr_lock:
+            if self.electrical_switch_asr_ready and self.electrical_switch_asr_model is not None:
+                return True
 
-        model_path = self.electrical_switch_asr_model_path
-        if os.path.sep in model_path and not os.path.exists(model_path):
-            rospy.logerr("Direct switch ASR model path does not exist: %s", model_path)
-            return False
+            if self.electrical_switch_asr_hf_endpoint:
+                os.environ.setdefault("HF_ENDPOINT", self.electrical_switch_asr_hf_endpoint)
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                rospy.logerr("faster-whisper is not available for direct switch ASR: %s", exc)
+                return False
 
-        try:
-            rospy.loginfo(
-                "Loading direct switch ASR model: path=%s device=%s compute=%s",
-                model_path,
-                self.electrical_switch_asr_device,
-                self.electrical_switch_asr_compute_type,
-            )
-            start = time.time()
-            self.electrical_switch_asr_model = WhisperModel(
-                model_path,
-                device=self.electrical_switch_asr_device,
-                compute_type=self.electrical_switch_asr_compute_type,
-            )
-            self.electrical_switch_asr_ready = True
-            rospy.loginfo("Direct switch ASR model loaded in %.2fs", time.time() - start)
-            return True
-        except Exception as exc:
-            self.electrical_switch_asr_model = None
-            self.electrical_switch_asr_ready = False
-            rospy.logerr("Failed to load direct switch ASR model: %s", exc)
-            return False
+            model_path = self.electrical_switch_asr_model_path
+            if os.path.sep in model_path and not os.path.exists(model_path):
+                rospy.logerr("Direct switch ASR model path does not exist: %s", model_path)
+                return False
+
+            try:
+                rospy.loginfo(
+                    "Loading direct switch ASR model: path=%s device=%s compute=%s",
+                    model_path,
+                    self.electrical_switch_asr_device,
+                    self.electrical_switch_asr_compute_type,
+                )
+                start = time.time()
+                self.electrical_switch_asr_model = WhisperModel(
+                    model_path,
+                    device=self.electrical_switch_asr_device,
+                    compute_type=self.electrical_switch_asr_compute_type,
+                )
+                self.electrical_switch_asr_ready = True
+                rospy.loginfo("Direct switch ASR model loaded in %.2fs", time.time() - start)
+                return True
+            except Exception as exc:
+                self.electrical_switch_asr_model = None
+                self.electrical_switch_asr_ready = False
+                rospy.logerr("Failed to load direct switch ASR model: %s", exc)
+                return False
 
     def record_electrical_switch_audio_window(self, window_seconds, window_index):
         sample_rate = max(8000, int(self.electrical_switch_asr_sample_rate))
@@ -1174,6 +1697,7 @@ class RealOwnerSearchBeforeAction:
             target_seconds,
             self.electrical_switch_asr_capture_device,
         )
+        self.play_electrical_switch_ready_ding()
         try:
             proc = subprocess.run(
                 cmd,
@@ -1203,6 +1727,15 @@ class RealOwnerSearchBeforeAction:
         peak = audioop.max(raw_audio, bytes_per_sample)
         rospy.loginfo("Direct switch ASR window %d audio stats: rms=%d peak=%d", window_index, rms, peak)
 
+        if (
+            self.electrical_switch_asr_transcribe_from_memory
+            and not self.electrical_switch_asr_keep_wav
+            and sample_rate == 16000
+            and channels == 1
+        ):
+            audio = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+            return {"audio": audio, "wav_path": "", "rms": rms, "peak": peak}
+
         try:
             os.makedirs(self.electrical_switch_asr_wav_dir, exist_ok=True)
             wav_path = os.path.join(
@@ -1215,14 +1748,20 @@ class RealOwnerSearchBeforeAction:
             rospy.logerr("Failed to write direct switch ASR wav: %s", exc)
             return None
 
-    def transcribe_electrical_switch_audio(self, wav_path, window_index):
+    def transcribe_electrical_switch_audio(self, audio_input, window_index):
         if not self.ensure_electrical_switch_asr_model():
             return None
+
+        wav_path = audio_input
+        audio_source = audio_input
+        if isinstance(audio_input, dict):
+            wav_path = audio_input.get("wav_path", "")
+            audio_source = audio_input.get("audio")
 
         try:
             start = time.time()
             segments, _ = self.electrical_switch_asr_model.transcribe(
-                wav_path,
+                audio_source,
                 language=self.electrical_switch_asr_language,
                 vad_filter=self.electrical_switch_asr_vad_filter,
                 beam_size=self.electrical_switch_asr_beam_size,
@@ -1241,7 +1780,7 @@ class RealOwnerSearchBeforeAction:
             rospy.logerr("Direct switch ASR transcription failed: %s", exc)
             return None
         finally:
-            if wav_path and not self.electrical_switch_asr_keep_wav:
+            if isinstance(wav_path, str) and wav_path and not self.electrical_switch_asr_keep_wav:
                 try:
                     os.unlink(wav_path)
                 except OSError:
@@ -1312,6 +1851,7 @@ class RealOwnerSearchBeforeAction:
                 window_seconds,
                 self.asr_topic,
             )
+            self.play_electrical_switch_ready_ding()
             window_end = time.time() + window_seconds
             while not rospy.is_shutdown() and time.time() < window_end:
                 if deadline is not None and time.time() >= deadline:
@@ -1340,6 +1880,108 @@ class RealOwnerSearchBeforeAction:
             window_index += 1
 
         return ""
+
+    def build_local_switch_command_test_cmd(self):
+        script_path = os.path.expanduser(self.electrical_switch_script_path)
+        if not os.path.isabs(script_path):
+            script_path = os.path.join(self.task_package_dir, script_path)
+        script_path = os.path.abspath(script_path)
+
+        window_seconds = max(0.5, self.electrical_switch_instruction_window_seconds)
+        cmd = [self.electrical_switch_script_python, "-u", script_path]
+        if self.electrical_switch_script_until_result:
+            cmd.append("--until-result")
+        cmd.extend(["--count", "1"])
+
+        def add_arg(flag, value):
+            value = "" if value is None else str(value)
+            if value:
+                cmd.extend([flag, value])
+
+        add_arg("--mic-device", self.electrical_switch_asr_capture_device)
+        add_arg("--sample-rate", self.electrical_switch_asr_sample_rate)
+        add_arg("--seconds", window_seconds)
+        add_arg("--energy-threshold", self.electrical_switch_asr_energy_threshold)
+        add_arg("--model-size", self.electrical_switch_asr_model_path)
+        add_arg("--hf-endpoint", self.electrical_switch_asr_hf_endpoint)
+        add_arg("--asr-device", self.electrical_switch_asr_device)
+        add_arg("--compute-type", self.electrical_switch_asr_compute_type)
+        add_arg("--language", self.electrical_switch_asr_language)
+        add_arg("--beam-size", self.electrical_switch_asr_beam_size)
+        add_arg("--no-speech-threshold", self.electrical_switch_asr_no_speech_threshold)
+        add_arg("--llm-url", self.electrical_switch_ollama_url)
+        add_arg("--llm-model", self.electrical_switch_ollama_model)
+        add_arg("--llm-timeout", self.electrical_switch_ollama_timeout)
+        add_arg("--llm-max-tokens", self.electrical_switch_ollama_max_tokens)
+        add_arg("--llm-keep-alive", self.electrical_switch_ollama_keep_alive)
+        if self.electrical_switch_asr_vad_filter:
+            cmd.append("--vad-filter")
+        else:
+            cmd.append("--no-vad")
+        if self.electrical_switch_asr_keep_wav:
+            cmd.append("--keep-wav")
+        return script_path, cmd
+
+    def run_local_switch_command_test(self):
+        script_path, cmd = self.build_local_switch_command_test_cmd()
+        if not os.path.exists(script_path):
+            rospy.logerr("Local switch command script does not exist: %s", script_path)
+            return "unknown"
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env["LOCAL_SWITCH_READY_DING"] = "1" if self.electrical_switch_ready_ding_enabled else "0"
+        env["LOCAL_SWITCH_READY_DING_WAV"] = self.electrical_switch_ready_ding_wav
+        env["LOCAL_SWITCH_READY_DING_FREQUENCY"] = str(self.electrical_switch_ready_ding_frequency)
+        env["LOCAL_SWITCH_READY_DING_SECONDS"] = str(self.electrical_switch_ready_ding_duration)
+        env["LOCAL_SWITCH_READY_DING_VOLUME"] = str(self.electrical_switch_ready_ding_volume)
+        env["LOCAL_SWITCH_READY_DING_PLAYER"] = self.electrical_switch_ready_ding_player
+        env["LOCAL_SWITCH_READY_DING_SPEAKER_DEVICE"] = self.electrical_switch_ready_ding_speaker_device
+        rospy.loginfo("Starting local switch command test subprocess: %s", " ".join(cmd))
+
+        action = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=self.task_package_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                bufsize=0,
+            )
+        except OSError as exc:
+            rospy.logerr("Failed to start local switch command test subprocess: %s", exc)
+            return "unknown"
+
+        try:
+            for raw_line in iter(proc.stdout.readline, b""):
+                line = raw_line.decode("utf-8", errors="replace")
+                if self.should_print_electrical_switch_script_line(line):
+                    try:
+                        sys.stdout.buffer.write(raw_line)
+                        sys.stdout.buffer.flush()
+                    except Exception:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+
+                match = re.search(r"判断结果:\s*(on|off|unknown)\b", line)
+                if match:
+                    action = match.group(1)
+            returncode = proc.wait()
+        except Exception as exc:
+            rospy.logerr("Error while reading local switch command test output: %s", exc)
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            return "unknown"
+
+        if returncode != 0:
+            rospy.logwarn("local_switch_command_test.py exited with code %s", returncode)
+        if action not in ("on", "off", "unknown"):
+            action = "unknown"
+        return action
 
     def publish_electrical_switch_state(self):
         self.electrical_switch_state_pub.publish(String(data=self.electrical_switch_state))
@@ -1399,18 +2041,32 @@ class RealOwnerSearchBeforeAction:
         """Conservative fallback used when Ollama is unavailable or malformed."""
         text = str(transcript).strip()
         negation = re.search(r"(不要|不用|别|不想|无需|不需要|禁止|不能|别把|不用把)", text)
-        if re.search(r"(关|断开|断电|停|拔掉|灭)", text) and not re.search(r"(开|接通|上电|亮)", text):
+        if re.search(r"(关闭|关掉|关上|关了|关一下|断开|断电|停掉|停止|拔掉|熄灭|灭掉)", text):
+            return "off"
+        if re.search(r"(打开|开启|开一下|开开|开机|开起来|接通|上电|启动|点亮|亮起)", text) and not negation:
+            return "on"
+
+        text_without_switch_noun = re.sub(r"开关", "", text)
+        if re.search(r"(关|灭)", text_without_switch_noun) and not re.search(r"(开|接通|上电|亮)", text_without_switch_noun):
             return "off"
         if (
-            re.search(r"(开|接通|上电|启动|亮)", text)
+            re.search(r"(开|接通|上电|启动|亮)", text_without_switch_noun)
             and not negation
-            and not re.search(r"(关|断开|断电|灭)", text)
+            and not re.search(r"(关|断开|断电|灭)", text_without_switch_noun)
         ):
             return "on"
         return "unknown"
 
     def classify_electrical_switch_instruction(self, transcript):
         """Use local Ollama first, with the reference script's keyword fallback."""
+        keyword_action = self.electrical_switch_keyword_fallback(transcript)
+        if self.electrical_switch_fast_keyword_first and keyword_action in ("on", "off"):
+            rospy.loginfo("Electrical switch instruction classified by fast keyword path: %s", keyword_action)
+            return keyword_action
+        if not self.should_try_electrical_switch_ollama():
+            rospy.logwarn("Skipping electrical switch Ollama classification due to recent warmup/request failure")
+            return keyword_action
+
         prompt = (
             "/no_think\n"
             "判断说话内容是否要开启或关闭电气开关。只输出一行 JSON，不要任何解释。\n"
@@ -1432,6 +2088,7 @@ class RealOwnerSearchBeforeAction:
                 "top_p": 0.7,
                 "num_predict": self.electrical_switch_ollama_max_tokens,
                 "num_ctx": 1024,
+                "num_gpu": max(0, self.electrical_switch_ollama_num_gpu),
             },
         }
         request = urllib.request.Request(
@@ -1450,64 +2107,111 @@ class RealOwnerSearchBeforeAction:
             action = self.parse_electrical_switch_action(content)
             if action == "unknown":
                 rospy.logwarn("Ollama returned an unknown electrical switch action: %s", content)
+                if keyword_action in ("on", "off"):
+                    rospy.loginfo("Using keyword fallback after unknown Ollama result: %s", keyword_action)
+                    return keyword_action
             else:
                 rospy.loginfo("Electrical switch instruction classified by Ollama: %s", action)
+            self.electrical_switch_ollama_available = True
             return action
         except (OSError, ValueError, TypeError, urllib.error.URLError) as exc:
+            self.electrical_switch_ollama_available = False
+            self.electrical_switch_ollama_last_failure = time.time()
             rospy.logwarn("Electrical switch Ollama classification failed: %s", exc)
-            action = self.electrical_switch_keyword_fallback(transcript)
-            rospy.loginfo("Using keyword fallback for electrical switch instruction: %s", action)
-            return action
+            rospy.loginfo("Using keyword fallback for electrical switch instruction: %s", keyword_action)
+            return keyword_action
 
     def wait_for_electrical_switch_instruction(self):
-        """Ask once, then process owner speech in repeated fixed windows."""
+        """Ask once, then listen until an on/off switch command is recognized."""
         if not self.electrical_switch_instruction_enabled:
             rospy.loginfo("Electrical switch voice interaction is disabled")
             return "unknown"
 
         source = self.electrical_switch_instruction_source
-        if source in ("direct", "direct_asr", "mic", "microphone"):
-            if not self.ensure_electrical_switch_asr_model():
-                transcript = ""
-            else:
+        self.wait_for_electrical_switch_preload()
+        self.begin_electrical_switch_voice_phase()
+        try:
+            if source in ("local_script", "script", "local_switch", "local_switch_command_test"):
                 self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
-                transcript = self.collect_direct_electrical_switch_transcript()
-        elif source in ("topic", "ros", "ros_topic", "voice_topic"):
-            with self.lock:
-                self.latest_asr_text = ""
-                self.latest_asr_time = None
-            self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
-            transcript = self.collect_ros_topic_electrical_switch_transcript()
-        else:
-            rospy.logwarn(
-                "Unknown electrical_switch_instruction_source=%s; falling back to direct_asr",
-                source,
-            )
-            if not self.ensure_electrical_switch_asr_model():
-                transcript = ""
-            else:
-                self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
-                transcript = self.collect_direct_electrical_switch_transcript()
+                action = self.run_local_switch_command_test()
+                self.electrical_switch_state = action
+                self.publish_electrical_switch_state()
+                return action
 
-        if not transcript:
-            rospy.logwarn(
-                "No electrical switch instruction text received by source=%s",
-                source,
-            )
             action = "unknown"
-        else:
-            rospy.loginfo("Electrical switch instruction transcript for LLM: %s", transcript)
-            action = self.classify_electrical_switch_instruction(transcript)
+            if source in ("direct", "direct_asr", "mic", "microphone"):
+                if not self.ensure_electrical_switch_asr_model():
+                    action = "unknown"
+                else:
+                    self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+                    while not rospy.is_shutdown():
+                        transcript = self.collect_direct_electrical_switch_transcript()
+                        if not transcript:
+                            rospy.logwarn(
+                                "No electrical switch instruction text received by source=%s",
+                                source,
+                            )
+                            break
+                        rospy.loginfo("Electrical switch instruction transcript for LLM: %s", transcript)
+                        action = self.classify_electrical_switch_instruction(transcript)
+                        if action in ("on", "off"):
+                            break
+                        rospy.logwarn("No switch command recognized from transcript; listening again")
+            elif source in ("topic", "ros", "ros_topic", "voice_topic"):
+                with self.lock:
+                    self.latest_asr_text = ""
+                    self.latest_asr_time = None
+                self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+                while not rospy.is_shutdown():
+                    transcript = self.collect_ros_topic_electrical_switch_transcript()
+                    if not transcript:
+                        rospy.logwarn(
+                            "No electrical switch instruction text received by source=%s",
+                            source,
+                        )
+                        break
+                    rospy.loginfo("Electrical switch instruction transcript for LLM: %s", transcript)
+                    action = self.classify_electrical_switch_instruction(transcript)
+                    if action in ("on", "off"):
+                        break
+                    rospy.logwarn("No switch command recognized from transcript; listening again")
+            else:
+                rospy.logwarn(
+                    "Unknown electrical_switch_instruction_source=%s; falling back to direct_asr",
+                    source,
+                )
+                if not self.ensure_electrical_switch_asr_model():
+                    action = "unknown"
+                else:
+                    self.say(self.electrical_switch_prompt, hold=self.electrical_switch_prompt_hold)
+                    while not rospy.is_shutdown():
+                        transcript = self.collect_direct_electrical_switch_transcript()
+                        if not transcript:
+                            rospy.logwarn(
+                                "No electrical switch instruction text received by source=%s",
+                                source,
+                            )
+                            break
+                        rospy.loginfo("Electrical switch instruction transcript for LLM: %s", transcript)
+                        action = self.classify_electrical_switch_instruction(transcript)
+                        if action in ("on", "off"):
+                            break
+                        rospy.logwarn("No switch command recognized from transcript; listening again")
 
-        self.electrical_switch_state = action
-        self.publish_electrical_switch_state()
-        reply = {
-            "on": self.electrical_switch_reply_on,
-            "off": self.electrical_switch_reply_off,
-            "unknown": self.electrical_switch_reply_unknown,
-        }.get(action, self.electrical_switch_reply_unknown)
-        self.say(reply)
-        return action
+            if action not in ("on", "off"):
+                action = "unknown"
+
+            self.electrical_switch_state = action
+            self.publish_electrical_switch_state()
+            reply = {
+                "on": self.electrical_switch_reply_on,
+                "off": self.electrical_switch_reply_off,
+                "unknown": self.electrical_switch_reply_unknown,
+            }.get(action, self.electrical_switch_reply_unknown)
+            self.say(reply)
+            return action
+        finally:
+            self.end_electrical_switch_voice_phase()
 
     def get_latest_yaw(self):
         with self.lock:
@@ -1516,6 +2220,36 @@ class RealOwnerSearchBeforeAction:
     def get_latest_odom_xy(self):
         with self.lock:
             return self.latest_odom_xy
+
+    def get_latest_odom_linear_speed(self, max_age=None):
+        with self.lock:
+            if self.latest_odom_linear_speed is None or self.latest_odom_time is None:
+                return None
+            if max_age is not None and time.time() - self.latest_odom_time > max_age:
+                return None
+            return self.latest_odom_linear_speed
+
+    def update_approach_slow_finish_cycles(self, remaining_distance, commanded_linear_speed, previous_cycles):
+        if not self.approach_slow_finish_enabled:
+            return 0, None, "disabled"
+
+        remaining_distance = max(0.0, float(remaining_distance))
+        if remaining_distance > self.approach_slow_finish_tolerance:
+            return 0, None, "not_near"
+
+        commanded_speed = abs(float(commanded_linear_speed))
+        actual_speed = self.get_latest_odom_linear_speed(max_age=self.approach_odom_speed_max_age)
+        command_slow = commanded_speed <= self.approach_slow_finish_linear_speed
+        odom_slow = actual_speed is not None and actual_speed <= self.approach_slow_finish_linear_speed
+        if command_slow or odom_slow:
+            if command_slow and odom_slow:
+                reason = "command_and_odom_slow"
+            elif command_slow:
+                reason = "command_slow"
+            else:
+                reason = "odom_slow"
+            return previous_cycles + 1, actual_speed, reason
+        return 0, actual_speed, "moving"
 
     def wait_for_odom_xy(self, timeout=1.0):
         deadline = time.time() + max(0.0, timeout)
@@ -1888,17 +2622,330 @@ class RealOwnerSearchBeforeAction:
             rospy.logwarn("Unable to clear move_base costmaps %s: %s", reason, exc)
             return False
 
-    def send_navigation_goal(self, goal):
+    def send_navigation_goal(self, goal, timeout=None, label=None):
+        wait_timeout = self.navigate_timeout if timeout is None else max(0.1, float(timeout))
+        target_label = label or self.waypoint_name
         self.move_base.send_goal(goal)
-        finished = self.move_base.wait_for_result(rospy.Duration(self.navigate_timeout))
+        finished = self.move_base.wait_for_result(rospy.Duration(wait_timeout))
         if not finished:
             self.move_base.cancel_goal()
-            return False, "move_base timed out while navigating to %s" % self.waypoint_name
+            return False, "move_base timed out while navigating to %s" % target_label
 
         state = self.move_base.get_state()
         if state != GoalStatus.SUCCEEDED:
             return False, "move_base failed with state %s" % state
         return True, ""
+
+    def ensure_move_base_for_approach(self):
+        if not self.approach_navigation_enabled:
+            return False
+        if self.move_base.wait_for_server(rospy.Duration(max(0.1, self.approach_navigation_server_timeout))):
+            return True
+        self.last_approach_failure_reason = "move_base action server unavailable for owner approach"
+        rospy.logwarn(self.last_approach_failure_reason)
+        return False
+
+    def lookup_robot_navigation_pose(self):
+        if self.tf_listener is None:
+            self.last_approach_failure_reason = "tf is unavailable; cannot convert owner approach goal to map frame"
+            rospy.logwarn(self.last_approach_failure_reason)
+            return None
+        try:
+            self.tf_listener.waitForTransform(
+                self.approach_navigation_frame,
+                self.approach_navigation_base_frame,
+                rospy.Time(0),
+                rospy.Duration(max(0.1, self.approach_navigation_tf_timeout)),
+            )
+            translation, rotation = self.tf_listener.lookupTransform(
+                self.approach_navigation_frame,
+                self.approach_navigation_base_frame,
+                rospy.Time(0),
+            )
+            yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+            return float(translation[0]), float(translation[1]), float(yaw)
+        except Exception as exc:
+            self.last_approach_failure_reason = "cannot transform %s to %s for owner approach: %s" % (
+                self.approach_navigation_base_frame,
+                self.approach_navigation_frame,
+                exc,
+            )
+            rospy.logwarn(self.last_approach_failure_reason)
+            return None
+
+    def relative_navigation_goal(self, forward, lateral=0.0, yaw=0.0):
+        robot_pose = self.lookup_robot_navigation_pose()
+        if robot_pose is None:
+            return None
+        robot_x, robot_y, robot_yaw = robot_pose
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+        map_x = robot_x + cos_yaw * float(forward) - sin_yaw * float(lateral)
+        map_y = robot_y + sin_yaw * float(forward) + cos_yaw * float(lateral)
+        map_yaw = robot_yaw + float(yaw)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = self.approach_navigation_frame
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = map_x
+        goal.target_pose.pose.position.y = map_y
+        goal.target_pose.pose.position.z = 0.0
+        goal.target_pose.pose.orientation.z = math.sin(map_yaw * 0.5)
+        goal.target_pose.pose.orientation.w = math.cos(map_yaw * 0.5)
+        return goal
+
+    def navigation_goal_remaining_distance(self, goal):
+        robot_pose = self.lookup_robot_navigation_pose()
+        if robot_pose is None:
+            return None
+        robot_x, robot_y, _robot_yaw = robot_pose
+        goal_x = float(goal.target_pose.pose.position.x)
+        goal_y = float(goal.target_pose.pose.position.y)
+        return math.hypot(goal_x - robot_x, goal_y - robot_y)
+
+    def navigate_relative_for_approach(
+        self,
+        forward,
+        lateral=0.0,
+        yaw=0.0,
+        timeout=None,
+        label="owner approach",
+        lidar_guard_distance=None,
+    ):
+        move_distance = math.hypot(float(forward), float(lateral))
+        if move_distance <= self.approach_navigation_min_distance:
+            self.stop_base()
+            rospy.loginfo(
+                "%s relative navigation skipped near target: move=%.2f min=%.2f",
+                label,
+                move_distance,
+                self.approach_navigation_min_distance,
+            )
+            return True
+        if not self.ensure_move_base_for_approach():
+            return False
+
+        if self.clear_costmaps_before_navigation and self.approach_navigation_clear_costmaps_before_goal:
+            self.clear_move_base_costmaps("before %s" % label)
+
+        goal = self.relative_navigation_goal(forward, lateral, yaw)
+        if goal is None:
+            return False
+        wait_timeout = self.approach_navigation_timeout if timeout is None else timeout
+        rospy.loginfo(
+            "%s using move_base map goal from relative command: frame=%s rel=(%.2f, %.2f, %.2f) map=(%.2f, %.2f) timeout=%.1f",
+            label,
+            self.approach_navigation_frame,
+            forward,
+            lateral,
+            yaw,
+            goal.target_pose.pose.position.x,
+            goal.target_pose.pose.position.y,
+            wait_timeout,
+        )
+        success, error_message = self.send_approach_navigation_goal(
+            goal,
+            move_distance,
+            timeout=wait_timeout,
+            label=label,
+            lidar_guard_distance=lidar_guard_distance,
+        )
+        obstacle_failure = "blocked by close obstacle" in error_message or "stuck or blocked" in error_message
+        if not success and self.approach_navigation_retry_after_clear and not obstacle_failure:
+            rospy.logwarn("%s; clearing costmaps and retrying %s once", error_message, label)
+            self.clear_move_base_costmaps("after %s failure" % label)
+            goal.target_pose.header.stamp = rospy.Time.now()
+            success, error_message = self.send_approach_navigation_goal(
+                goal,
+                move_distance,
+                timeout=wait_timeout,
+                label=label,
+                lidar_guard_distance=lidar_guard_distance,
+            )
+
+        self.stop_base()
+        if not success:
+            self.last_approach_failure_reason = error_message
+            rospy.logwarn("%s failed: %s", label, error_message)
+            return False
+        rospy.loginfo("%s relative navigation complete", label)
+        return True
+
+    def send_approach_navigation_goal(self, goal, move_distance, timeout=None, label="owner approach", lidar_guard_distance=None):
+        self.move_base.send_goal(goal)
+        start_xy = self.wait_for_odom_xy(timeout=0.2)
+        deadline = time.time() + max(0.1, float(timeout if timeout is not None else self.approach_navigation_timeout))
+        slow_finish_cycles = 0
+        best_remaining = float(move_distance)
+        last_progress_time = time.time()
+        rate = rospy.Rate(10)
+
+        while not rospy.is_shutdown() and time.time() < deadline:
+            state = self.move_base.get_state()
+            travelled = None
+            remaining = None
+            goal_remaining = self.navigation_goal_remaining_distance(goal)
+            if goal_remaining is not None:
+                remaining = goal_remaining
+            if start_xy is not None:
+                travelled = self.xy_distance(start_xy, self.get_latest_odom_xy())
+                if remaining is None and travelled is not None:
+                    remaining = max(0.0, float(move_distance) - travelled)
+
+            if state == GoalStatus.SUCCEEDED:
+                success_tolerance = max(self.approach_navigation_min_distance, self.approach_slow_finish_tolerance)
+                if remaining is None or remaining <= success_tolerance:
+                    return True, ""
+                return False, (
+                    "move_base reported success before reaching %s approach goal: remaining=%.2f tolerance=%.2f"
+                    % (label, remaining, success_tolerance)
+                )
+            if state in (
+                GoalStatus.PREEMPTED,
+                GoalStatus.ABORTED,
+                GoalStatus.REJECTED,
+                GoalStatus.RECALLED,
+                GoalStatus.LOST,
+            ):
+                return False, "move_base failed while navigating to %s with state %s" % (label, state)
+
+            if remaining is not None and remaining <= self.approach_navigation_min_distance:
+                self.move_base.cancel_goal()
+                return True, ""
+
+            front_distance = None
+            if lidar_guard_distance is not None:
+                front_distance = self.front_scan_distance()
+                if front_distance is not None and front_distance <= lidar_guard_distance:
+                    self.move_base.cancel_goal()
+                    if remaining is not None and remaining <= self.approach_slow_finish_tolerance:
+                        rospy.loginfo(
+                            "%s navigation accepted at lidar guard near target: travelled=%.2f target=%.2f remaining=%.2f lidar=%.2f guard=%.2f",
+                            label,
+                            travelled if travelled is not None else -1.0,
+                            move_distance,
+                            remaining,
+                            front_distance,
+                            lidar_guard_distance,
+                        )
+                        return True, ""
+                    return False, "%s blocked by close obstacle: lidar=%.2f guard=%.2f remaining=%s" % (
+                        label,
+                        front_distance,
+                        lidar_guard_distance,
+                        "%.2f" % remaining if remaining is not None else "unknown",
+                    )
+
+            if remaining is not None:
+                if remaining + max(0.0, self.approach_navigation_stuck_min_progress) < best_remaining:
+                    best_remaining = remaining
+                    last_progress_time = time.time()
+
+                slow_finish_cycles, actual_speed, slow_reason = self.update_approach_slow_finish_cycles(
+                    remaining,
+                    self.approach_linear_speed,
+                    slow_finish_cycles,
+                )
+                if slow_finish_cycles >= self.approach_slow_finish_cycles:
+                    self.move_base.cancel_goal()
+                    rospy.loginfo(
+                        "%s navigation accepted slow/stop near target: travelled=%.2f target=%.2f remaining=%.2f odom_speed=%.3f reason=%s cycles=%d",
+                        label,
+                        travelled if travelled is not None else -1.0,
+                        move_distance,
+                        remaining,
+                        actual_speed if actual_speed is not None else -1.0,
+                        slow_reason,
+                        slow_finish_cycles,
+                    )
+                    return True, ""
+
+                stuck_timeout = max(0.0, self.approach_navigation_stuck_timeout)
+                if stuck_timeout > 0.0 and time.time() - last_progress_time >= stuck_timeout:
+                    actual_speed = self.get_latest_odom_linear_speed(max_age=self.approach_odom_speed_max_age)
+                    if actual_speed is None or actual_speed <= self.approach_navigation_stuck_linear_speed:
+                        if front_distance is None:
+                            front_distance = self.front_scan_distance()
+                        self.move_base.cancel_goal()
+                        return False, (
+                            "%s stuck or blocked before target: remaining=%.2f best_remaining=%.2f "
+                            "odom_speed=%s lidar=%s"
+                            % (
+                                label,
+                                remaining,
+                                best_remaining,
+                                "%.3f" % actual_speed if actual_speed is not None else "unknown",
+                                "%.2f" % front_distance if front_distance is not None else "unknown",
+                            )
+                        )
+
+            rate.sleep()
+
+        self.move_base.cancel_goal()
+        return False, "move_base timed out while navigating to %s" % label
+
+    def navigate_to_owner_standoff(
+        self,
+        position,
+        standoff_distance,
+        max_travel=None,
+        timeout=None,
+        label="owner approach",
+        lidar_guard_distance=None,
+        lateral_offset=0.0,
+    ):
+        distance = max(0.0, float(position.get("distance", 0.0)))
+        if distance <= 1e-3:
+            self.stop_base()
+            rospy.loginfo("%s skipped: owner distance unavailable/zero", label)
+            return True
+
+        travel_distance = max(0.0, distance - max(0.0, float(standoff_distance)))
+        if max_travel is not None:
+            travel_distance = min(travel_distance, max(0.0, float(max_travel)))
+        if travel_distance <= self.approach_navigation_min_distance:
+            self.stop_base()
+            rospy.loginfo(
+                "%s already within standoff/navigation threshold: distance=%.2f standoff=%.2f travel=%.2f",
+                label,
+                distance,
+                standoff_distance,
+                travel_distance,
+            )
+            return True
+
+        scale = travel_distance / distance
+        owner_x = float(position.get("x", 0.0))
+        owner_y = float(position.get("y", 0.0))
+        offset = float(lateral_offset)
+        forward = owner_x * scale
+        lateral = owner_y * scale
+        if abs(offset) > 1e-3:
+            unit_x = owner_x / distance
+            unit_y = owner_y / distance
+            forward += -unit_y * offset
+            lateral += unit_x * offset
+        face_x = owner_x - forward
+        face_y = owner_y - lateral
+        yaw = math.atan2(face_y, max(0.05, face_x))
+        if abs(offset) > 1e-3:
+            rospy.loginfo(
+                "%s using lateral standoff offset %.2fm: owner=(%.2f, %.2f) goal_rel=(%.2f, %.2f)",
+                label,
+                offset,
+                owner_x,
+                owner_y,
+                forward,
+                lateral,
+            )
+        return self.navigate_relative_for_approach(
+            forward,
+            lateral,
+            yaw=yaw,
+            timeout=timeout,
+            label=label,
+            lidar_guard_distance=lidar_guard_distance,
+        )
 
     def navigate_to_waypoint(self):
         if not self.navigate_enabled:
@@ -2645,6 +3692,11 @@ class RealOwnerSearchBeforeAction:
 
         standoff_distance = clamp(abs(self.fall_approach_standoff_distance), 0.45, 1.8)
         distance_tolerance = max(0.02, self.fall_approach_distance_tolerance)
+        fast_finish_tolerance = clamp(
+            abs(self.fall_approach_fast_finish_tolerance),
+            distance_tolerance,
+            0.30,
+        )
         max_travel = max(0.0, self.fall_approach_max_travel_distance)
         travel_distance = clamp(position["distance"] - standoff_distance, 0.0, max_travel)
         lidar_guard_distance = max(0.30, self.fall_approach_lidar_stop_distance + self.fall_approach_lidar_margin)
@@ -2668,6 +3720,36 @@ class RealOwnerSearchBeforeAction:
             rospy.loginfo("Owner is already within standoff distance")
             return True
 
+        if travel_distance <= fast_finish_tolerance:
+            self.stop_base()
+            rospy.loginfo(
+                "Owner blind approach near target; accepting without slow finish: travel=%.2f tolerance=%.2f",
+                travel_distance,
+                fast_finish_tolerance,
+            )
+            return True
+
+        if self.approach_navigation_enabled:
+            if self.navigate_to_owner_standoff(
+                position,
+                standoff_distance,
+                max_travel=max_travel,
+                timeout=self.fall_approach_drive_timeout,
+                label="owner blind approach",
+                lidar_guard_distance=lidar_guard_distance,
+            ):
+                return True
+            if not self.approach_direct_fallback_enabled:
+                rospy.logwarn(
+                    "Owner blind approach stopped after move_base failure; direct cmd_vel fallback is disabled: %s",
+                    self.last_approach_failure_reason,
+                )
+                return False
+            rospy.logwarn(
+                "Owner blind approach falling back to direct cmd_vel after move_base failure: %s",
+                self.last_approach_failure_reason,
+            )
+
         current_yaw = self.get_latest_yaw()
         if current_yaw is not None and abs(position["bearing"]) > self.approach_bearing_tolerance:
             target_yaw = current_yaw + position["bearing"]
@@ -2687,6 +3769,7 @@ class RealOwnerSearchBeforeAction:
         deadline = start_time + max(1.0, self.fall_approach_drive_timeout)
         rate = rospy.Rate(10)
         used_timed_fallback = start_xy is None
+        slow_finish_cycles = 0
         if used_timed_fallback:
             rospy.logwarn("No odom position available; using timed owner blind drive")
 
@@ -2709,12 +3792,14 @@ class RealOwnerSearchBeforeAction:
                 travelled = 0.0
 
             remaining = travel_distance - travelled
-            if remaining <= distance_tolerance:
+            if remaining <= fast_finish_tolerance:
                 self.stop_base()
                 rospy.loginfo(
-                    "Owner blind approach complete: travelled=%.2f target=%.2f timed_fallback=%s",
+                    "Owner blind approach complete: travelled=%.2f target=%.2f remaining=%.2f tolerance=%.2f timed_fallback=%s",
                     travelled,
                     travel_distance,
+                    remaining,
+                    fast_finish_tolerance,
                     used_timed_fallback,
                 )
                 return True
@@ -2730,6 +3815,24 @@ class RealOwnerSearchBeforeAction:
 
             twist = Twist()
             twist.linear.x = max(0.0, speed)
+            slow_finish_cycles, actual_speed, slow_reason = self.update_approach_slow_finish_cycles(
+                remaining,
+                twist.linear.x,
+                slow_finish_cycles,
+            )
+            if slow_finish_cycles >= self.approach_slow_finish_cycles:
+                self.stop_base()
+                rospy.loginfo(
+                    "Owner blind approach accepted slow/stop near target: travelled=%.2f target=%.2f remaining=%.2f cmd=%.3f odom_speed=%.3f reason=%s cycles=%d",
+                    travelled,
+                    travel_distance,
+                    remaining,
+                    twist.linear.x,
+                    actual_speed if actual_speed is not None else -1.0,
+                    slow_reason,
+                    slow_finish_cycles,
+                )
+                return True
             self.cmd_pub.publish(twist)
             now = time.time()
             if start_xy is None:
@@ -2771,9 +3874,38 @@ class RealOwnerSearchBeforeAction:
         move_speed = max(0.03, move_speed)
         move_timeout = float(timeout) if timeout is not None else self.fall_approach_extra_close_timeout
         move_timeout = max(1.0, move_timeout)
+        finish_tolerance = clamp(
+            abs(self.fall_approach_extra_close_finish_tolerance),
+            0.02,
+            max(0.02, min(0.12, target_distance)),
+        )
         guard_distance = lidar_guard_distance
         if guard_distance is None:
             guard_distance = max(0.30, self.fall_approach_lidar_stop_distance + self.fall_approach_lidar_margin)
+
+        if self.approach_navigation_enabled:
+            nav_label = "%s extra-close advance" % label
+            if self.navigate_relative_for_approach(
+                target_distance,
+                0.0,
+                yaw=0.0,
+                timeout=move_timeout,
+                label=nav_label,
+                lidar_guard_distance=guard_distance,
+            ):
+                return True
+            if not self.approach_direct_fallback_enabled:
+                rospy.logwarn(
+                    "%s stopped after move_base failure; direct cmd_vel fallback is disabled: %s",
+                    nav_label,
+                    self.last_approach_failure_reason,
+                )
+                return False
+            rospy.logwarn(
+                "%s falling back to direct cmd_vel after move_base failure: %s",
+                nav_label,
+                self.last_approach_failure_reason,
+            )
 
         start_xy = self.wait_for_odom_xy(timeout=1.0)
         start_time = time.time()
@@ -2782,12 +3914,14 @@ class RealOwnerSearchBeforeAction:
         deadline = start_time + move_timeout
         rate = rospy.Rate(10)
         used_timed_fallback = start_xy is None
+        slow_finish_cycles = 0
 
         rospy.loginfo(
-            "%s extra-close advance: target=%.2fm speed=%.2fm/s guard=%.2fm timed_fallback=%s",
+            "%s extra-close advance: target=%.2fm speed=%.2fm/s finish_tol=%.2fm guard=%.2fm timed_fallback=%s",
             label,
             target_distance,
             move_speed,
+            finish_tolerance,
             guard_distance,
             used_timed_fallback,
         )
@@ -2812,21 +3946,42 @@ class RealOwnerSearchBeforeAction:
                 travelled = 0.0
 
             remaining = target_distance - travelled
-            if remaining <= 0.02:
+            if remaining <= finish_tolerance:
                 self.stop_base()
                 rospy.loginfo(
-                    "%s extra-close advance complete: travelled=%.2f target=%.2f",
+                    "%s extra-close advance complete: travelled=%.2f target=%.2f remaining=%.2f tolerance=%.2f",
                     label,
                     travelled,
                     target_distance,
+                    remaining,
+                    finish_tolerance,
                 )
                 return True
 
             twist = Twist()
-            twist.linear.x = min(move_speed, max(0.0, remaining))
+            twist.linear.x = move_speed
             if front_distance is not None:
                 clearance = front_distance - guard_distance
                 twist.linear.x = min(twist.linear.x, max(0.0, clearance) * 0.35)
+            slow_finish_cycles, actual_speed, slow_reason = self.update_approach_slow_finish_cycles(
+                remaining,
+                twist.linear.x,
+                slow_finish_cycles,
+            )
+            if slow_finish_cycles >= self.approach_slow_finish_cycles:
+                self.stop_base()
+                rospy.loginfo(
+                    "%s extra-close advance accepted slow/stop near target: travelled=%.2f target=%.2f remaining=%.2f cmd=%.3f odom_speed=%.3f reason=%s cycles=%d",
+                    label,
+                    travelled,
+                    target_distance,
+                    remaining,
+                    twist.linear.x,
+                    actual_speed if actual_speed is not None else -1.0,
+                    slow_reason,
+                    slow_finish_cycles,
+                )
+                return True
             self.cmd_pub.publish(twist)
             now = time.time()
             if start_xy is None:
@@ -2874,183 +4029,81 @@ class RealOwnerSearchBeforeAction:
                 self.owner_track_center = float(det.center_x) / image_width
 
         target_distance = clamp(abs(self.approach_standoff_distance), 0.35, 1.8)
+        distance_tolerance = max(0.02, self.approach_distance_tolerance)
+        fast_finish_tolerance = clamp(
+            abs(self.approach_fast_finish_tolerance),
+            distance_tolerance,
+            0.30,
+        )
         lidar_guard_distance = max(0.30, self.approach_lidar_stop_distance + self.approach_lidar_margin)
         rospy.loginfo(
-            "Approaching waving owner with Kinect point cloud: target=%.2fm lidar_guard=%.2fm topic=%s",
+            "Approaching waving owner with move_base: target=%.2fm finish_tol=%.2fm topic=%s",
             target_distance,
-            lidar_guard_distance,
+            fast_finish_tolerance,
             self.points_topic,
         )
+
         deadline = time.time() + max(1.0, self.approach_timeout)
-        stable_cycles = 0
-        saw_position = False
-        sent_forward_cmd = False
-        last_position = None
-        last_valid_time = 0.0
-        last_cmd = Twist()
-        stopped = True
-        self.last_approach_failure_reason = "approach did not start"
-
-        def publish_motion(cmd):
-            nonlocal last_cmd, stopped
-            alpha = clamp(self.approach_command_smoothing, 0.0, 1.0)
-            smoothed = Twist()
-            smoothed.linear.x = last_cmd.linear.x + (cmd.linear.x - last_cmd.linear.x) * alpha
-            smoothed.angular.z = last_cmd.angular.z + (cmd.angular.z - last_cmd.angular.z) * alpha
-            if abs(cmd.linear.x) < 1e-3:
-                smoothed.linear.x = 0.0
-            if abs(cmd.angular.z) < 1e-3:
-                smoothed.angular.z = 0.0
-            self.cmd_pub.publish(smoothed)
-            last_cmd = smoothed
-            stopped = False
-
-        def stop_once():
-            nonlocal last_cmd, stopped
-            if not stopped:
-                self.stop_base()
-            last_cmd = Twist()
-            stopped = True
-
-        def coast_or_stop(reason):
-            nonlocal stable_cycles
-            stable_cycles = 0
-            self.last_approach_failure_reason = reason
-            if last_valid_time > 0.0 and time.time() - last_valid_time <= self.approach_missing_data_grace:
-                coast = Twist()
-                coast.linear.x = max(0.0, last_cmd.linear.x * clamp(self.approach_missing_linear_scale, 0.0, 1.0))
-                coast.angular.z = last_cmd.angular.z
-                publish_motion(coast)
-                return
-            stop_once()
-
         rate = rospy.Rate(10)
+        position = None
+        fallback_used = False
+        self.last_approach_failure_reason = "no valid owner position before move_base approach"
+
         while not rospy.is_shutdown() and time.time() < deadline:
             det, width, height = self.select_tracking_detection()
-            front_distance = self.front_scan_distance()
+            if (det is None or width is None or height is None) and owner_candidate is not None and not fallback_used:
+                det = owner_candidate.get("det")
+                width = owner_candidate.get("image_width")
+                height = owner_candidate.get("image_height")
+                fallback_used = det is not None
 
-            twist = Twist()
             if det is None or width is None or height is None or width <= 0 or height <= 0:
-                coast_or_stop("lost owner detection during approach")
+                self.last_approach_failure_reason = "no owner detection before waving-owner move_base approach"
                 rate.sleep()
                 continue
 
-            center_norm = float(det.center_x) / float(width)
-            self.owner_track_center = center_norm
+            self.owner_track_center = float(det.center_x) / float(width)
             position = self.estimate_owner_position_from_pointcloud(det, width, height)
-            if position is None:
-                coast_or_stop(self.last_pointcloud_reason or "no valid owner point cloud position")
-                rate.sleep()
-                continue
+            if position is not None:
+                break
 
-            saw_position = True
-            last_position = position
-            last_valid_time = time.time()
-            distance = position["distance"]
-            bearing = position["bearing"]
-            distance_error = distance - target_distance
-            lidar_blocked = front_distance is not None and front_distance <= lidar_guard_distance
-            lidar_missing_required = self.approach_require_lidar and front_distance is None
-            if lidar_missing_required:
-                rospy.logwarn_throttle(2.0, "Waiting for valid front lidar before approaching owner")
-                self.last_approach_failure_reason = "front lidar required but unavailable"
-                stable_cycles = 0
-                stop_once()
-                rate.sleep()
-                continue
-
-            within_distance = distance <= target_distance + self.approach_distance_tolerance
-            within_bearing = abs(bearing) <= self.approach_bearing_tolerance
-            if lidar_blocked:
-                stop_once()
-                rospy.loginfo(
-                    "Waving owner approach stopped at lidar guard: mode=%s pointcloud_dist=%.2f bearing=%.3f samples=%d lidar=%.2f",
-                    position["mode"],
-                    distance,
-                    bearing,
-                    position["samples"],
-                    front_distance if front_distance is not None else -1.0,
-                )
-                return True
-
-            if within_distance:
-                stable_cycles += 1
-                stop_once()
-                if stable_cycles >= self.approach_arrival_stable_cycles:
-                    rospy.loginfo(
-                        "Waving owner point-cloud approach complete: mode=%s distance=%.2f bearing=%.3f bearing_ok=%s samples=%d lidar=%.2f",
-                        position["mode"],
-                        distance,
-                        bearing,
-                        within_bearing,
-                        position["samples"],
-                        front_distance if front_distance is not None else -1.0,
-                    )
-                    return True
-                rate.sleep()
-                continue
-
-            stable_cycles = 0
-            twist.angular.z = clamp(
-                self.approach_angular_gain * bearing,
-                -self.approach_max_angular_speed,
-                self.approach_max_angular_speed,
-            )
-            forward_bearing_limit = max(self.approach_center_tolerance, self.approach_forward_bearing_limit)
-            if abs(bearing) <= forward_bearing_limit and distance_error > self.approach_distance_tolerance:
-                speed = clamp(
-                    self.approach_linear_gain * distance_error,
-                    self.approach_min_linear_speed,
-                    self.approach_linear_speed,
-                )
-                if front_distance is not None:
-                    clearance = front_distance - lidar_guard_distance
-                    speed = min(speed, max(0.0, clearance) * 0.35)
-                twist.linear.x = max(0.0, speed)
-                sent_forward_cmd = sent_forward_cmd or twist.linear.x > 0.0
-            elif distance_error > self.approach_distance_tolerance:
-                self.last_approach_failure_reason = "owner bearing too large for forward motion: bearing=%.3f limit=%.3f distance=%.2f" % (
-                    bearing,
-                    forward_bearing_limit,
-                    distance,
-                )
-
-            rospy.loginfo_throttle(
-                1.0,
-                "Owner point-cloud approach: mode=%s distance=%.2f err=%.2f bearing=%.3f cmd=(%.2f, %.2f) samples=%d lidar=%.2f",
-                position["mode"],
-                distance,
-                distance_error,
-                bearing,
-                twist.linear.x,
-                twist.angular.z,
-                position["samples"],
-                front_distance if front_distance is not None else -1.0,
-            )
-            publish_motion(twist)
+            self.last_approach_failure_reason = self.last_pointcloud_reason or "no valid owner point cloud position"
             rate.sleep()
 
-        stop_once()
-        if last_position is not None and last_position["distance"] <= target_distance + max(0.20, self.approach_distance_tolerance):
-            rospy.logwarn(
-                "Waving owner approach timed out near target; accepting stop: distance=%.2f target=%.2f bearing=%.3f",
-                last_position["distance"],
+        if position is None:
+            self.stop_base()
+            rospy.logwarn("Waving owner move_base approach cannot start: %s", self.last_approach_failure_reason)
+            return False
+
+        distance = position["distance"]
+        bearing = position["bearing"]
+        if distance <= target_distance + fast_finish_tolerance:
+            self.stop_base()
+            rospy.loginfo(
+                "Waving owner already within move_base standoff: mode=%s distance=%.2f target=%.2f bearing=%.3f samples=%d",
+                position["mode"],
+                distance,
                 target_distance,
-                last_position["bearing"],
+                bearing,
+                position["samples"],
             )
             return True
-        if saw_position:
-            self.last_approach_failure_reason = (
-                "timed out before reaching target; last distance=%.2f target=%.2f bearing=%.3f forward_cmd=%s"
-                % (
-                    last_position["distance"],
-                    target_distance,
-                    last_position["bearing"],
-                    sent_forward_cmd,
-                )
-            )
-        rospy.logwarn("Waving owner approach timed out: %s", self.last_approach_failure_reason)
-        return False
+
+        if not self.approach_navigation_enabled:
+            self.stop_base()
+            self.last_approach_failure_reason = "move_base owner approach is disabled"
+            rospy.logwarn("Waving owner approach aborted: %s", self.last_approach_failure_reason)
+            return False
+
+        nav_lidar_guard = lidar_guard_distance if self.approach_navigation_lidar_guard_enabled else None
+        return self.navigate_to_owner_standoff(
+            position,
+            target_distance,
+            timeout=self.approach_navigation_timeout,
+            label="waving owner move_base approach",
+            lidar_guard_distance=nav_lidar_guard,
+        )
+
 
     def run(self):
         self.set_yolo_paused(False)
@@ -3074,9 +4127,7 @@ class RealOwnerSearchBeforeAction:
 
         centered = self.center_owner_in_camera(owner_candidate)
         if not centered:
-            if self.speak_on_finish:
-                self.say("我已经识别到主人，但相机居中不稳定。")
-            return True
+            rospy.logwarn("Owner centering unstable; skipping centering and continuing action recognition")
 
         self.say("识别中。")
         action_label, action_confidence, action_reason = self.recognize_owner_action(owner_candidate)
@@ -3123,13 +4174,13 @@ class RealOwnerSearchBeforeAction:
                 self.say(self.approach_help_prompt)
             else:
                 reason = self.last_approach_failure_reason
-                rospy.logwarn("Waving owner approach did not complete before help prompt: %s", reason)
-                if "lidar guard" in reason:
-                    self.say("我前方距离太近，先停在这里。" + self.approach_help_prompt)
+                rospy.logwarn("Waving owner move_base approach did not complete: %s", reason)
+                if "lidar guard" in reason or "blocked by close obstacle" in reason:
+                    self.say("我前方有障碍，暂时无法靠近您。")
                 elif "point cloud" in reason or "ROI" in reason:
-                    self.say("我看到您在挥手，但点云定位还不稳定，我先在这里听您指示。" + self.approach_help_prompt)
+                    self.say("我看到您在挥手，但点云定位还不稳定，暂时无法靠近您。")
                 else:
-                    self.say("我看到您在挥手，正在这里听您指示。" + self.approach_help_prompt)
+                    self.say("我看到您在挥手，但还没有成功靠近您。")
         return True
 
 

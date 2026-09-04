@@ -13,10 +13,11 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   std_msgs
   std_srvs
+  tf
 )
 
 catkin_package(
-  CATKIN_DEPENDS actionlib actionlib_msgs cv_bridge geometry_msgs move_base_msgs nav_msgs perception_msgs rospy sensor_msgs std_msgs std_srvs
+  CATKIN_DEPENDS actionlib actionlib_msgs cv_bridge geometry_msgs move_base_msgs nav_msgs perception_msgs rospy sensor_msgs std_msgs std_srvs tf
 )
 
 catkin_install_python(PROGRAMS

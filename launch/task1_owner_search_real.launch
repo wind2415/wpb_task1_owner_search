@@ -2,6 +2,7 @@
   <arg name="start_robot" default="true" />
   <arg name="start_yolo" default="true" />
   <arg name="show_yolo_viewer" default="true" />
+  <arg name="yolo_output" default="log" />
   <arg name="start_voice" default="true" />
   <arg name="start_asr" default="false" />
   <arg name="start_tts" default="true" />
@@ -59,7 +60,8 @@
   </group>
 
   <group if="$(arg start_yolo)">
-    <node pkg="yoloworld_perception" type="yoloworld_node.py" name="yoloworld" output="screen">
+    <node pkg="yoloworld_perception" type="yoloworld_node.py" name="yoloworld" output="$(arg yolo_output)">
+      <env name="PYTORCH_CUDA_ALLOC_CONF" value="expandable_segments:True" />
       <param name="image_topic" value="$(arg image_topic)" />
       <param name="model_path" value="$(find yoloworld_perception)/models/yolov8s-world-person.pt" />
       <param name="device" value="$(arg device)" />
@@ -76,7 +78,7 @@
     </node>
   </group>
 
-  <node if="$(arg show_yolo_viewer)" pkg="yoloworld_perception" type="yoloworld_debug_viewer.py" name="yoloworld_bbox_debug_viewer" output="screen">
+  <node if="$(arg show_yolo_viewer)" pkg="yoloworld_perception" type="yoloworld_debug_viewer.py" name="yoloworld_bbox_debug_viewer" output="$(arg yolo_output)">
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="debug_image_topic" value="$(arg yolo_debug_image_topic)" />
     <param name="show_raw" value="false" />
@@ -97,6 +99,7 @@
   </group>
 
   <node if="$(arg start_task)" pkg="wpb_task1_owner_search" type="task1_find_owner_real.py" name="task1_find_owner_real" output="screen">
+    <env name="CUDA_VISIBLE_DEVICES" value="" />
     <rosparam command="load" file="$(find wpb_task1_owner_search)/config/task1_owner_search_real.yaml" />
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="detections_topic" value="$(arg detections_topic)" />

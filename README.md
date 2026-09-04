@@ -34,12 +34,12 @@ The launch file starts the same core drivers used by the WPB Home examples:
 - `/dev/rplidar` through `rplidar_ros`, filtered to `/scan`
 - `kinect2_bridge` for `/kinect2/qhd/image_color_rect`
 - `jie_ware/lidar_loc` localization, `move_base`, and `wpbh_local_planner`
-- Offline voice bridge with PiperTTS on `/voice/say` and `sound_play` playback; the switch-command step uses task-local direct ASR by default
+- Offline voice bridge with PiperTTS on `/voice/say` and `sound_play` playback; the switch-command step runs `tools/local_switch_command_test.py` as a standalone subprocess by default
 - `yoloworld_perception` on `cuda:0`, with YOLO bounding-box debug image on `/perception/yoloworld/debug_image`
 
 The task node waits for `/kinect2/qhd/image_color_rect`, `/scan`, and `/odom` before it starts moving. This is intentional for real robot safety.
 
-Speech output is routed through `offline_voice_bridge`, not the xfyun stack. The task publishes text to `/voice/say`; `offline_tts_node.py` uses PiperTTS to generate a wav and `sound_play` plays it through the audio device on the machine running the launch file. Background `offline_asr_node.py` is disabled by default in this task launch so it does not occupy the microphone; the switch-command step records and recognizes its own 5-second audio windows inside `task1_find_owner_real.py`. You can still pass `start_asr:=true` when you specifically want to debug the shared `/voice/asr_text` topic.
+Speech output is routed through `offline_voice_bridge`, not the xfyun stack. The task publishes prompt text to `/voice/say`; `offline_tts_node.py` uses PiperTTS to generate a wav and `sound_play` plays it through the audio device on the machine running the launch file. Background `offline_asr_node.py` is disabled by default in this task launch so it does not occupy the microphone; after the task says `请指示。`, the switch-command step starts `python3 -u tools/local_switch_command_test.py` as a standalone subprocess so the same microphone, ASR, LLM, TTS, and `aplay` logs are visible in the task terminal. You can still pass `start_asr:=true` when you specifically want to debug the shared `/voice/asr_text` topic.
 
 ## Files To Prepare
 
@@ -111,7 +111,7 @@ roslaunch wpb_task1_owner_search task1_owner_search_task_only.launch
 
 The recommended two-terminal flow starts TTS/sound playback in
 `task1_owner_search_bringup.launch`; background ASR is disabled by default
-because the task records the switch instruction directly after saying
+because the task runs the standalone local switch-command script after saying
 `请指示。`. If only `task_only` is running, start its voice chain explicitly:
 
 ```bash
@@ -120,7 +120,7 @@ roslaunch wpb_task1_owner_search task1_owner_search_task_only.launch start_voice
 
 If you explicitly want to debug the shared `/voice/asr_text` topic, add
 `start_asr:=true`. The task's switch-command path does not require it in the
-default `direct_asr` mode.
+default `local_script` mode.
 
 The launch defaults the ASR microphone to the ALSA `default` capture device,
 which matches the `wpb_home` voice stack. Check the actual device on the robot
@@ -187,7 +187,7 @@ Do not use that setting in the final competition flow because the robot may acce
 
 ## Owner Action Recognition
 
-After InsightFace confirms the owner, the robot centers the owner in the Kinect image, says `识别中。`, samples `/kinect2/qhd/image_color_rect` for 7 seconds, and announces the detected action.
+After InsightFace confirms the owner, the robot tries to center the owner in the Kinect image. If centering is unstable or times out, it silently skips centering, says `识别中。`, samples `/kinect2/qhd/image_color_rect` for 7 seconds, and announces the detected action.
 
 The action recognizer follows the lightweight YOLO-pose sampling logic used by `wpr_simulation/scripts/action_camera_piper.py`, but it reads ROS camera frames from the real robot instead of opening a local USB camera.
 
@@ -208,17 +208,19 @@ Current supported action announcements:
 
 Fall detection is treated as a transition, not just a final posture. The node compares the first and last thirds of the 7-second pose window and reports a fall when the owner starts mostly upright/non-lying and ends mostly lying, with supporting motion evidence such as full-frame body center drop, torso rotation, wider body box, or reduced body-box height. This avoids classifying a one-time fall as merely `lying` when the final frames are already horizontal.
 
-When the detected action is `waving`, the real robot does not use simulation-only model-state hints or a Gazebo 3D goal. It samples `/kinect2/qhd/points` inside the verified owner's Kinect 2D person box, estimates the owner's 3D position relative to the robot, moves forward with a conservative point-cloud distance controller, uses `/scan` as an extra front safety guard, stops at the configured 0.70 m standoff distance, and then asks `请问您需要什么帮助？`.
+Sitting detection uses YOLO-pose keypoints plus a small evidence score instead of relying on only one perfect full-body pose. A frame can support `sitting` through bent knees, knees close to hips, one-sided knee/hip evidence, a roughly horizontal thigh, ankles folded closer to the hips, or a compact seated body box, while still requiring the torso to remain reasonably vertical and not lying-like. The final `sitting` verdict is still based on repeated evidence across the 7-second sampling window, with relaxed recovery thresholds in `config/task1_owner_search_real.yaml` for frames where one leg keypoint is missing.
 
-The waving approach defaults to a 25-second window and a 0.18 m/s maximum forward speed. To avoid stop-and-go motion, short point-cloud or detection dropouts reuse the last valid motion command with a smooth decay instead of immediately stopping. If it cannot finish, the node logs the concrete reason, such as missing point cloud, too few valid ROI points, large bearing error, lidar guard blocking, or timeout before reaching the target distance.
+When the detected action is `waving`, the real robot does not use simulation-only model-state hints or a Gazebo 3D goal. It samples `/kinect2/qhd/points` inside the verified owner's Kinect 2D person box, estimates the owner's 3D position relative to the robot, converts that relative offset from `base_footprint` into a `map` goal with TF, then sends a `move_base` goal to reach the configured standoff distance. The default waving standoff is 0.45 m with 0.05 m finish tolerance, keeping the final target within 0.50 m before asking `请问您需要什么帮助？`.
+
+The waving approach defaults to a 25-second owner-position sampling window before handing the final approach to `move_base`. `approach_navigation_enabled: true` is the normal path; `approach_direct_fallback_enabled: false` prevents the robot from reverting to blind forward motion if `move_base` cannot plan the near-owner approach. If it cannot finish, the node logs the concrete reason and does not ask the help prompt from a far position.
 
 When the detected action is `falling`, the robot announces `识别到主人摔倒。`, snapshots the owner's 3D position, approaches by odometry, then advances a short extra distance, and finally runs the arm assist motion. If the final pose is only classified as static `lying`, the robot first samples Kinect point-cloud surface height inside the owner box: low surfaces are treated as `lying_ground` and handled the same as a fall, while elevated surfaces are treated as sofa/bed/chair lying and announced as `识别到主人躺下。`.
 
-Fall, non-fall lying, and sitting states use the same blind approach mode: the robot records a single relative 3D target, turns toward that bearing using `/odom`, then drives the measured distance by wheel odometry without requiring repeated 2D owner detections. `/scan` remains active as a forward safety guard. After that it can add a small extra forward nudge so it sits closer to the owner. Only fall and floor-lying cases extend the arm on `/wpb_home/mani_ctrl`: extend with `name=['lift','gripper']`, hold briefly, then retract.
+Fall, non-fall lying, and sitting states use the same snapshot approach mode: the robot records a single relative 3D target and, by default, transforms the standoff point into the `map` frame before sending it to `move_base` instead of manually driving the measured distance by wheel odometry. The extra-close nudge also uses a transformed `map` goal first, so it participates in obstacle avoidance; direct `/cmd_vel` movement is only used if `approach_navigation_enabled` is disabled or `approach_direct_fallback_enabled` is explicitly enabled. `/scan` remains active as a forward safety guard. `fall_approach_fast_finish_tolerance` and `fall_approach_extra_close_finish_tolerance` prevent the final near-owner nudge from crawling for the last few centimeters. Only fall and floor-lying cases extend the arm on `/wpb_home/mani_ctrl`: extend with `name=['lift','gripper']`, hold briefly, then retract.
 
-After the robot completes the approach and extra forward nudge for a normal `sitting` or elevated `lying` owner, it says `请指示。` and then runs an independent direct-ASR switch-command loop. In the default `direct_asr` mode, the task node itself records 5 seconds from the ALSA microphone, writes a temporary wav under `/dev/shm`, transcribes it with the local faster-whisper Chinese model, and classifies the transcript with the local Ollama endpoint (`qwen3.5:2b`) using the same JSON contract as `offline_voice_bridge/tools/local_switch_command_test.py`; if Ollama is unavailable, the task uses conservative keyword fallback. If a 5-second window has no recognized speech text, the task starts the next 5-second window instead of immediately giving up. The result is recorded as `on`, `off`, or `unknown` and published latched on `/electrical_switch/state`, followed by the corresponding fixed voice response. Fall and floor-lying (`lying_ground`) paths do not enter this interaction and retain the arm-assist behavior. This package currently records and publishes the requested state; it does not actuate physical switch hardware because no switch-driver topic/service is defined here.
+After the robot completes the approach and extra forward nudge for a normal `sitting` or elevated `lying` owner, it says `请指示。` and then runs `python3 -u tools/local_switch_command_test.py --until-result --count 1` as a standalone subprocess. In the default `local_script` mode, that script records 4-second ALSA microphone windows, writes the `/dev/shm/local_switch_record_zh.wav` recording, transcribes it with faster-whisper, classifies the transcript with the local Ollama endpoint (`qwen3.5:2b`), prints the `== 第 1 轮 ===` / `识别文本` / `LLM 输出` / `判断结果` / `TTS` / `aplay` lines directly in the task terminal, and plays the fixed response itself. If one round has no recognized text, the same preloaded ASR/LLM/TTS process immediately starts `第 2 轮`, then `第 3 轮`, until a transcript is classified. The task node parses the script's `判断结果:` line, records `on`, `off`, or `unknown`, and publishes it latched on `/electrical_switch/state`. Fall and floor-lying (`lying_ground`) paths do not enter this interaction and retain the arm-assist behavior. This package currently records and publishes the requested state; it does not actuate physical switch hardware because no switch-driver topic/service is defined here.
 
-The default `electrical_switch_instruction_timeout: 0.0` means there is no total timeout for the repeated 5-second instruction windows. Set `electrical_switch_instruction_max_empty_windows` or a positive `electrical_switch_instruction_timeout` if testing needs a hard stop.
+The default standalone script mode loops through 4-second instruction rounds until one round produces a switch judgment. Set `electrical_switch_script_until_result: false`, or switch `electrical_switch_instruction_source` back to `direct_asr` or `ros_topic`, only if you want the older one-shot/internal recognizer behavior.
 
 ## Useful Checks
 

@@ -20,6 +20,7 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>tf</depend>
 
   <exec_depend>amcl</exec_depend>
   <exec_depend>jie_ware</exec_depend>

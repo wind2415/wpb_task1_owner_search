@@ -1,5 +1,6 @@
 <launch>
   <arg name="show_yolo_viewer" default="false" />
+  <arg name="yolo_output" default="log" />
   <arg name="start_rviz" default="true" />
   <arg name="start_voice" default="true" />
   <arg name="start_asr" default="false" />
@@ -18,6 +19,7 @@
     <arg name="start_robot" value="true" />
     <arg name="start_yolo" value="true" />
     <arg name="show_yolo_viewer" value="$(arg show_yolo_viewer)" />
+    <arg name="yolo_output" value="$(arg yolo_output)" />
     <arg name="start_voice" value="$(arg start_voice)" />
     <arg name="start_asr" value="$(arg start_asr)" />
     <arg name="start_tts" value="$(arg start_tts)" />
