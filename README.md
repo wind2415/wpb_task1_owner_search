@@ -9,7 +9,7 @@ real hardware bringup
   -> map localization and move_base navigation
   -> YOLO-World person detection on GPU
   -> InsightFace owner verification on CPU
-  -> rotate scan at living_room
+  -> run the same owner-search task at living_room, kitchen, bedroom, then canteen
   -> center verified owner in the Kinect camera
   -> sample the robot camera for 7 seconds
   -> speak the owner's action
@@ -71,11 +71,19 @@ If `map.yaml` and `map.pgm` are in the same directory, keep the YAML image entry
 image: map.pgm
 ```
 
-The waypoint file must contain a waypoint named:
+The waypoint file must contain these task waypoints:
 
 ```text
 living_room
+kitchen
+bedroom
+canteen
 ```
+
+After those room tasks finish, the robot navigates to `exit`. If the saved exit
+waypoint is still named `1`, the task node renames that waypoint to `exit` on
+startup when the waypoint file is writable; it also treats `1` as an `exit`
+alias so the final navigation still works if the rename cannot be written.
 
 If your map is temporarily elsewhere, pass it through the `map:=...` launch argument.
 
@@ -206,21 +214,21 @@ Current supported action announcements:
 - owner is waving
 - action is uncertain
 
-Fall detection is treated as a transition, not just a final posture. The node compares the first and last thirds of the 7-second pose window and reports a fall when the owner starts mostly upright/non-lying and ends mostly lying, with supporting motion evidence such as full-frame body center drop, torso rotation, wider body box, or reduced body-box height. This avoids classifying a one-time fall as merely `lying` when the final frames are already horizontal.
+Fall detection is treated as two related states: `falling` means the camera saw an active upright-to-lying transition, while `lying_ground` means the owner was already lying on the floor when the robot observed them. The node only reports `falling` when the first and last thirds of the 7-second pose window show a clear transition with multiple motion signals; otherwise, static `lying`/low-confidence `unknown` results are checked with Kinect point-cloud surface height and low-image-position hints so floor-level lying is still handled as an already-fallen owner.
 
 Sitting detection uses YOLO-pose keypoints plus a small evidence score instead of relying on only one perfect full-body pose. A frame can support `sitting` through bent knees, knees close to hips, one-sided knee/hip evidence, a roughly horizontal thigh, ankles folded closer to the hips, or a compact seated body box, while still requiring the torso to remain reasonably vertical and not lying-like. The final `sitting` verdict is still based on repeated evidence across the 7-second sampling window, with relaxed recovery thresholds in `config/task1_owner_search_real.yaml` for frames where one leg keypoint is missing.
 
-When the detected action is `waving`, the real robot does not use simulation-only model-state hints or a Gazebo 3D goal. It samples `/kinect2/qhd/points` inside the verified owner's Kinect 2D person box, estimates the owner's 3D position relative to the robot, converts that relative offset from `base_footprint` into a `map` goal with TF, then sends a `move_base` goal to reach the configured standoff distance. The default waving standoff is 0.45 m with 0.05 m finish tolerance, keeping the final target within 0.50 m before asking `请问您需要什么帮助？`.
+When the detected action is `waving`, the real robot does not use simulation-only model-state hints or a Gazebo 3D goal. It samples `/kinect2/qhd/points` inside the verified owner's Kinect 2D person box, estimates the owner's 3D position relative to the robot, converts that relative offset from `base_footprint` into a `map` goal with TF, then sends a `move_base` goal to reach the configured standoff distance. The default waving standoff is 0.45 m with 0.05 m finish tolerance, keeping the final target within 0.50 m before asking `请问您需要什么帮助？`, then waiting `waving_help_pause_seconds` before moving to the next waypoint.
 
-The waving approach defaults to a 25-second owner-position sampling window before handing the final approach to `move_base`. `approach_navigation_enabled: true` is the normal path; `approach_direct_fallback_enabled: false` prevents the robot from reverting to blind forward motion if `move_base` cannot plan the near-owner approach. If it cannot finish, the node logs the concrete reason and does not ask the help prompt from a far position.
+The waving approach defaults to a 25-second owner-position sampling window before handing the obstacle-avoiding approach to `move_base`. It stops and cancels the action as soon as the robot has moved into the configured `waving_approach_safety_radius` (default 0.48 m), then starts the voice interaction instead of continuing to chase the final goal. A short stationary finish is accepted only after odometry confirms that the robot moved. `waving_approach_plan_detour_ratio`, `waving_approach_plan_detour_margin`, and `waving_approach_plan_turn_limit` reject unusually large or unstable paths before sending a candidate goal. Waving navigation does not retry the same goal after clearing costmaps unless `waving_approach_retry_after_clear` is explicitly enabled. `approach_navigation_enabled: true` is the normal path; `approach_direct_fallback_enabled: false` prevents the robot from reverting to blind forward motion if `move_base` cannot plan the near-owner approach. If it cannot finish, the node logs the concrete reason and does not ask the help prompt from a far position.
 
 When the detected action is `falling`, the robot announces `识别到主人摔倒。`, snapshots the owner's 3D position, approaches by odometry, then advances a short extra distance, and finally runs the arm assist motion. If the final pose is only classified as static `lying`, the robot first samples Kinect point-cloud surface height inside the owner box: low surfaces are treated as `lying_ground` and handled the same as a fall, while elevated surfaces are treated as sofa/bed/chair lying and announced as `识别到主人躺下。`.
 
-Fall, non-fall lying, and sitting states use the same snapshot approach mode: the robot records a single relative 3D target and, by default, transforms the standoff point into the `map` frame before sending it to `move_base` instead of manually driving the measured distance by wheel odometry. The extra-close nudge also uses a transformed `map` goal first, so it participates in obstacle avoidance; direct `/cmd_vel` movement is only used if `approach_navigation_enabled` is disabled or `approach_direct_fallback_enabled` is explicitly enabled. `/scan` remains active as a forward safety guard. `fall_approach_fast_finish_tolerance` and `fall_approach_extra_close_finish_tolerance` prevent the final near-owner nudge from crawling for the last few centimeters. Only fall and floor-lying cases extend the arm on `/wpb_home/mani_ctrl`: extend with `name=['lift','gripper']`, hold briefly, then retract.
+Fall, non-fall lying, and sitting states use the same snapshot approach mode: the robot records a single relative 3D target and, by default, transforms the standoff point into the `map` frame before sending it to `move_base` instead of manually driving the measured distance by wheel odometry. The extra-close nudge also uses a transformed `map` goal first, so it participates in obstacle avoidance; direct `/cmd_vel` movement is only used if `approach_navigation_enabled` is disabled or `approach_direct_fallback_enabled` is explicitly enabled. `/scan` remains active as a forward safety guard. `fall_approach_fast_finish_tolerance` and `fall_approach_extra_close_finish_tolerance` prevent the final near-owner nudge from crawling for the last few centimeters. Fall and floor-lying cases always complete the `/wpb_home/mani_ctrl` arm sequence before leaving the waypoint: extend with `name=['lift','gripper']`, hold briefly, retract, then wait `fall_assist_arm_completion_wait`.
 
-After the robot completes the approach and extra forward nudge for a normal `sitting` or elevated `lying` owner, it says `请指示。` and then runs `python3 -u tools/local_switch_command_test.py --until-result --count 1` as a standalone subprocess. In the default `local_script` mode, that script records 4-second ALSA microphone windows, writes the `/dev/shm/local_switch_record_zh.wav` recording, transcribes it with faster-whisper, classifies the transcript with the local Ollama endpoint (`qwen3.5:2b`), prints the `== 第 1 轮 ===` / `识别文本` / `LLM 输出` / `判断结果` / `TTS` / `aplay` lines directly in the task terminal, and plays the fixed response itself. If one round has no recognized text, the same preloaded ASR/LLM/TTS process immediately starts `第 2 轮`, then `第 3 轮`, until a transcript is classified. The task node parses the script's `判断结果:` line, records `on`, `off`, or `unknown`, and publishes it latched on `/electrical_switch/state`. Fall and floor-lying (`lying_ground`) paths do not enter this interaction and retain the arm-assist behavior. This package currently records and publishes the requested state; it does not actuate physical switch hardware because no switch-driver topic/service is defined here.
+For a normal `sitting` or elevated `lying` owner, the robot enters the electrical-switch voice interaction even if the approach or extra forward nudge is blocked, stuck, or cannot complete; it stops the base first, then says `请指示。`. In the default `direct_asr` mode, the ready ding is played first, recording starts immediately after the ding finishes, and each recording window is 5 seconds. The owner should start speaking as soon as the ding ends and finish the command within that 5-second window. The recorded PCM is software-amplified before faster-whisper (`electrical_switch_asr_input_gain: 3.0`, auto gain target peak 70%, max gain 8.0), so quieter sitting/lying speech is easier to recognize. The task node classifies the transcript with keyword rules plus the local Ollama endpoint, records `on`, `off`, or `unknown`, and publishes it latched on `/electrical_switch/state`. Fall and floor-lying (`lying_ground`) paths do not enter this interaction and retain the arm-assist behavior.
 
-The default standalone script mode loops through 4-second instruction rounds until one round produces a switch judgment. Set `electrical_switch_script_until_result: false`, or switch `electrical_switch_instruction_source` back to `direct_asr` or `ros_topic`, only if you want the older one-shot/internal recognizer behavior.
+The optional standalone script mode loops through the configured instruction window until one round produces a switch judgment. Set `electrical_switch_script_until_result: false`, or switch `electrical_switch_instruction_source` to `ros_topic`, only if you want the older one-shot/topic recognizer behavior.
 
 ## Useful Checks
 

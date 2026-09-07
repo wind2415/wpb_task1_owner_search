@@ -28,6 +28,9 @@
   <arg name="map" default="$(find wpb_home_tutorials)/maps/map.yaml" />
   <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
   <arg name="waypoint_name" default="living_room" />
+  <arg name="task_waypoint_names" default="living_room,kitchen,bedroom,canteen" />
+  <arg name="exit_waypoint_name" default="exit" />
+  <arg name="exit_waypoint_aliases" default="1" />
   <arg name="navigate_enabled" default="true" />
 
   <arg name="image_topic" default="/kinect2/qhd/image_color_rect" />
@@ -107,6 +110,9 @@
     <param name="owner_image_path" value="$(arg owner_image_path)" />
     <param name="waypoint_file" value="$(arg waypoint_file)" />
     <param name="waypoint_name" value="$(arg waypoint_name)" />
+    <param name="task_waypoint_names" value="$(arg task_waypoint_names)" />
+    <param name="exit_waypoint_name" value="$(arg exit_waypoint_name)" />
+    <param name="exit_waypoint_aliases" value="$(arg exit_waypoint_aliases)" />
     <param name="navigate_enabled" value="$(arg navigate_enabled)" />
   </node>
 </launch>

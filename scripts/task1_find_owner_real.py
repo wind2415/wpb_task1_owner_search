@@ -26,9 +26,10 @@ except ImportError:
     tf = None
 from actionlib_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Twist
+from geometry_msgs.msg import Pose, PoseStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import Odometry
+from nav_msgs.srv import GetPlan
 from perception_msgs.msg import Detection2DArray
 from sensor_msgs.msg import Image, JointState, LaserScan, PointCloud2
 from std_msgs.msg import Bool, String
@@ -76,9 +77,26 @@ class RealOwnerSearchBeforeAction:
         self.last_pointcloud_reason = ""
         self.last_approach_failure_reason = ""
 
-        self.waypoint_name = rospy.get_param("~waypoint_name", "living_room")
+        self.waypoint_name = str(rospy.get_param("~waypoint_name", "living_room")).strip()
         self.waypoint_file = os.path.expanduser(rospy.get_param("~waypoint_file", "~/waypoints.xml"))
         self.owner_image_path = os.path.expanduser(rospy.get_param("~owner_image_path", ""))
+        self.task_waypoint_names = self.parse_waypoint_name_list(
+            rospy.get_param("~task_waypoint_names", [self.waypoint_name])
+        ) or [self.waypoint_name]
+        self.exit_waypoint_name = str(rospy.get_param("~exit_waypoint_name", "exit")).strip()
+        self.exit_waypoint_aliases = self.parse_waypoint_name_list(rospy.get_param("~exit_waypoint_aliases", ["1"]))
+        self.return_to_exit_when_complete = bool(rospy.get_param("~return_to_exit_when_complete", True))
+        self.rename_exit_waypoint_alias = bool(rospy.get_param("~rename_exit_waypoint_alias", True))
+        self.waypoint_speech_names = {
+            "living_room": "客厅",
+            "kitchen": "厨房",
+            "bedroom": "卧室",
+            "canteen": "餐厅",
+            "exit": "出口",
+        }
+        self.waypoint_speech_names.update(
+            self.parse_waypoint_speech_names(rospy.get_param("~waypoint_speech_names", {}))
+        )
 
         self.image_topic = rospy.get_param("~image_topic", "/kinect2/qhd/image_color_rect")
         self.detections_topic = rospy.get_param("~detections_topic", "/perception/person_detections_2d")
@@ -192,7 +210,18 @@ class RealOwnerSearchBeforeAction:
         self.action_fall_lie_ratio_gain = float(rospy.get_param("~action_fall_lie_ratio_gain", 0.35))
         self.action_fall_late_lie_ratio = float(rospy.get_param("~action_fall_late_lie_ratio", 0.45))
         self.action_fall_height_shrink_ratio = float(rospy.get_param("~action_fall_height_shrink_ratio", 0.82))
-        self.action_fall_early_upright_ratio = float(rospy.get_param("~action_fall_early_upright_ratio", 0.35))
+        self.action_fall_early_upright_ratio = float(rospy.get_param("~action_fall_early_upright_ratio", 0.50))
+        self.action_fall_early_lie_ratio_max = float(rospy.get_param("~action_fall_early_lie_ratio_max", 0.25))
+        self.action_fall_static_lie_ratio = float(rospy.get_param("~action_fall_static_lie_ratio", 0.65))
+        self.action_fall_early_det_aspect_max = float(rospy.get_param("~action_fall_early_det_aspect_max", 1.10))
+        self.action_fall_static_det_aspect_min = float(rospy.get_param("~action_fall_static_det_aspect_min", 1.20))
+        self.action_fall_min_transition_signals = max(
+            1,
+            int(rospy.get_param("~action_fall_min_transition_signals", 2)),
+        )
+        self.already_fallen_surface_labels = self.parse_string_list(
+            rospy.get_param("~already_fallen_surface_labels", ["lying", "unknown"])
+        )
         self.lying_surface_classification_enabled = bool(
             rospy.get_param("~lying_surface_classification_enabled", True)
         )
@@ -289,7 +318,59 @@ class RealOwnerSearchBeforeAction:
             float(rospy.get_param("~approach_navigation_stuck_linear_speed", 0.025))
         )
         self.approach_direct_fallback_enabled = bool(rospy.get_param("~approach_direct_fallback_enabled", False))
+        self.waving_approach_candidate_enabled = bool(
+            rospy.get_param("~waving_approach_candidate_enabled", True)
+        )
+        self.waving_approach_min_owner_distance = clamp(
+            abs(float(rospy.get_param("~waving_approach_min_owner_distance", 0.45))),
+            0.35,
+            0.50,
+        )
+        self.waving_approach_max_owner_distance = clamp(
+            abs(float(rospy.get_param("~waving_approach_max_owner_distance", 0.50))),
+            self.waving_approach_min_owner_distance,
+            0.50,
+        )
+        self.waving_approach_candidate_distances = self.parse_float_list(
+            rospy.get_param("~waving_approach_candidate_distances", [0.45, 0.48, 0.50])
+        )
+        self.waving_approach_candidate_angles_deg = self.parse_float_list(
+            rospy.get_param("~waving_approach_candidate_angles_deg", [65, -65, 95, -95, 35, -35, 0, 125, -125])
+        )
+        self.waving_approach_plan_check = bool(rospy.get_param("~waving_approach_plan_check", True))
+        self.waving_approach_plan_service = rospy.get_param(
+            "~waving_approach_plan_service", "/move_base/make_plan"
+        )
+        self.waving_approach_plan_tolerance = max(
+            0.0,
+            float(rospy.get_param("~waving_approach_plan_tolerance", 0.20)),
+        )
+        self.waving_approach_safety_radius = clamp(
+            abs(float(rospy.get_param("~waving_approach_safety_radius", 0.48))),
+            self.waving_approach_min_owner_distance,
+            self.waving_approach_max_owner_distance,
+        )
+        self.waving_approach_still_duration = max(
+            0.2,
+            float(rospy.get_param("~waving_approach_still_duration", 0.8)),
+        )
+        self.waving_approach_plan_detour_ratio = max(
+            1.0,
+            float(rospy.get_param("~waving_approach_plan_detour_ratio", 2.0)),
+        )
+        self.waving_approach_plan_detour_margin = max(
+            0.0,
+            float(rospy.get_param("~waving_approach_plan_detour_margin", 0.8)),
+        )
+        self.waving_approach_plan_turn_limit = max(
+            math.pi,
+            float(rospy.get_param("~waving_approach_plan_turn_limit", 4.5)),
+        )
+        self.waving_approach_retry_after_clear = bool(
+            rospy.get_param("~waving_approach_retry_after_clear", False)
+        )
         self.approach_help_prompt = rospy.get_param("~approach_help_prompt", "请问您需要什么帮助？")
+        self.waving_help_pause_seconds = max(0.0, float(rospy.get_param("~waving_help_pause_seconds", 3.0)))
 
         self.fall_approach_enabled = bool(rospy.get_param("~fall_approach_enabled", True))
         self.fall_approach_action_labels = self.parse_string_list(
@@ -337,6 +418,10 @@ class RealOwnerSearchBeforeAction:
         self.fall_assist_arm_extend_wait = float(rospy.get_param("~fall_assist_arm_extend_wait", 3.0))
         self.fall_assist_arm_hold_seconds = float(rospy.get_param("~fall_assist_arm_hold_seconds", 4.0))
         self.fall_assist_arm_retract_wait = float(rospy.get_param("~fall_assist_arm_retract_wait", 3.0))
+        self.fall_assist_arm_completion_wait = max(
+            0.0,
+            float(rospy.get_param("~fall_assist_arm_completion_wait", 1.0)),
+        )
         self.fall_assist_arm_command_rate = float(rospy.get_param("~fall_assist_arm_command_rate", 5.0))
 
         self.electrical_switch_instruction_enabled = bool(
@@ -440,10 +525,23 @@ class RealOwnerSearchBeforeAction:
         self.electrical_switch_asr_beam_size = int(rospy.get_param("~electrical_switch_asr_beam_size", 1))
         self.electrical_switch_asr_vad_filter = bool(rospy.get_param("~electrical_switch_asr_vad_filter", False))
         self.electrical_switch_asr_no_speech_threshold = float(
-            rospy.get_param("~electrical_switch_asr_no_speech_threshold", 0.6)
+            rospy.get_param("~electrical_switch_asr_no_speech_threshold", 0.8)
         )
         self.electrical_switch_asr_keep_wav = bool(rospy.get_param("~electrical_switch_asr_keep_wav", False))
         self.electrical_switch_asr_wav_dir = rospy.get_param("~electrical_switch_asr_wav_dir", "/dev/shm")
+        self.electrical_switch_asr_input_gain = max(
+            1.0,
+            float(rospy.get_param("~electrical_switch_asr_input_gain", 3.0)),
+        )
+        self.electrical_switch_asr_auto_gain_target_peak = clamp(
+            float(rospy.get_param("~electrical_switch_asr_auto_gain_target_peak", 0.70)),
+            0.0,
+            0.98,
+        )
+        self.electrical_switch_asr_max_gain = max(
+            self.electrical_switch_asr_input_gain,
+            float(rospy.get_param("~electrical_switch_asr_max_gain", 8.0)),
+        )
         self.electrical_switch_ollama_url = rospy.get_param(
             "~electrical_switch_ollama_url", "http://127.0.0.1:11434/api/chat"
         )
@@ -569,6 +667,7 @@ class RealOwnerSearchBeforeAction:
 
         self.move_base = actionlib.SimpleActionClient("move_base", MoveBaseAction)
         self.tf_listener = tf.TransformListener() if tf is not None else None
+        self.waving_make_plan = rospy.ServiceProxy(self.waving_approach_plan_service, GetPlan)
 
         if self.face_verify_enabled:
             self.owner_reference_images = self.load_owner_images()
@@ -652,6 +751,36 @@ class RealOwnerSearchBeforeAction:
             text = str(item).strip().lower()
             if text:
                 parsed.append(text)
+        return parsed
+
+    @staticmethod
+    def parse_waypoint_name_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_values = value.replace(";", ",").split(",")
+        elif isinstance(value, (list, tuple)):
+            raw_values = value
+        else:
+            raw_values = [value]
+
+        parsed = []
+        for item in raw_values:
+            text = str(item).strip()
+            if text:
+                parsed.append(text)
+        return parsed
+
+    @staticmethod
+    def parse_waypoint_speech_names(value):
+        if not isinstance(value, dict):
+            return {}
+        parsed = {}
+        for waypoint_name, speech_name in value.items():
+            key = str(waypoint_name).strip()
+            text = str(speech_name).strip()
+            if key and text:
+                parsed[key] = text
         return parsed
 
     @staticmethod
@@ -933,8 +1062,10 @@ class RealOwnerSearchBeforeAction:
         full_center_y_norm = center_y_norm
         full_box_height_norm = box_h / max(1.0, float(height))
         full_aspect = aspect
+        det_aspect = None
         if source_meta:
             frame_height = float(source_meta.get("frame_height") or height)
+            det_aspect = source_meta.get("det_aspect")
             crop_box = source_meta.get("crop_box")
             if crop_box is not None:
                 crop_x1, crop_y1, _crop_x2, _crop_y2 = [float(value) for value in crop_box]
@@ -1059,6 +1190,7 @@ class RealOwnerSearchBeforeAction:
         return {
             "aspect": aspect,
             "full_aspect": full_aspect,
+            "det_aspect": det_aspect,
             "center_y_norm": center_y_norm,
             "full_center_y_norm": full_center_y_norm,
             "full_box_height_norm": full_box_height_norm,
@@ -1128,6 +1260,8 @@ class RealOwnerSearchBeforeAction:
         last_aspect = self.median_value([feature.get("full_aspect", feature["aspect"]) for feature in last])
         first_height = self.median_value([feature.get("full_box_height_norm") for feature in first])
         last_height = self.median_value([feature.get("full_box_height_norm") for feature in last])
+        first_det_aspect = self.median_value([feature.get("det_aspect") for feature in first])
+        last_det_aspect = self.median_value([feature.get("det_aspect") for feature in last])
         first_lie_ratio = sum(1 for feature in first if feature["lying_like"]) / float(len(first))
         last_lie_ratio = sum(1 for feature in last if feature["lying_like"]) / float(len(last))
         first_upright_ratio = sum(1 for feature in first if feature["upright_like"]) / float(len(first))
@@ -1147,17 +1281,37 @@ class RealOwnerSearchBeforeAction:
             last_lie_ratio >= self.action_fall_late_lie_ratio
             and lie_ratio_gain >= self.action_fall_lie_ratio_gain
         )
-        motion_signal = (
-            center_drop > self.action_fall_center_drop
-            or torso_drop > self.action_fall_torso_drop
-            or aspect_gain > self.action_fall_aspect_gain
-            or height_shrunk
+        transition_signals = [
+            center_drop > self.action_fall_center_drop,
+            torso_drop > self.action_fall_torso_drop,
+            aspect_gain > self.action_fall_aspect_gain,
+            height_shrunk,
+            became_lying,
+        ]
+        transition_signal_count = sum(1 for matched in transition_signals if matched)
+        early_detection_not_upright = (
+            first_det_aspect is not None
+            and first_det_aspect > self.action_fall_early_det_aspect_max
         )
-        plausible_start = first_upright_ratio >= self.action_fall_early_upright_ratio or first_lie_ratio <= 0.35
+        static_detection_lying = (
+            first_det_aspect is not None
+            and last_det_aspect is not None
+            and first_det_aspect >= self.action_fall_static_det_aspect_min
+            and last_det_aspect >= self.action_fall_static_det_aspect_min
+        )
+        static_lying = (
+            first_lie_ratio >= self.action_fall_static_lie_ratio
+            and last_lie_ratio >= self.action_fall_static_lie_ratio
+        ) or static_detection_lying
+        plausible_start = (
+            first_upright_ratio >= self.action_fall_early_upright_ratio
+            and first_lie_ratio <= self.action_fall_early_lie_ratio_max
+            and not early_detection_not_upright
+        )
 
         rospy.loginfo(
             "Owner action fall metrics: samples=%d first_lie=%.2f last_lie=%.2f first_upright=%.2f "
-            "center_drop=%.2f torso_drop=%.2f aspect_gain=%.2f height_ratio=%s",
+            "center_drop=%.2f torso_drop=%.2f aspect_gain=%.2f height_ratio=%s det_aspect=%s->%s transition_signals=%d static_lying=%s",
             len(usable),
             first_lie_ratio,
             last_lie_ratio,
@@ -1166,8 +1320,17 @@ class RealOwnerSearchBeforeAction:
             torso_drop,
             aspect_gain,
             "%.2f" % height_ratio if height_ratio is not None else "NA",
+            "%.2f" % first_det_aspect if first_det_aspect is not None else "NA",
+            "%.2f" % last_det_aspect if last_det_aspect is not None else "NA",
+            transition_signal_count,
+            static_lying,
         )
-        if plausible_start and last_lie_ratio >= self.action_fall_late_lie_ratio and (motion_signal or became_lying):
+        if (
+            not static_lying
+            and plausible_start
+            and last_lie_ratio >= self.action_fall_late_lie_ratio
+            and transition_signal_count >= self.action_fall_min_transition_signals
+        ):
             confidence = clamp(
                 0.58
                 + max(0.0, center_drop) * 1.4
@@ -1667,6 +1830,35 @@ class RealOwnerSearchBeforeAction:
                 rospy.logerr("Failed to load direct switch ASR model: %s", exc)
                 return False
 
+    def amplify_electrical_switch_audio(self, raw_audio, bytes_per_sample, window_index):
+        if bytes_per_sample != 2 or not raw_audio:
+            return raw_audio, 1.0, None, None
+
+        samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            return raw_audio, 1.0, None, None
+
+        input_peak = float(np.max(np.abs(samples)))
+        gain = max(1.0, float(self.electrical_switch_asr_input_gain))
+        target_peak = float(self.electrical_switch_asr_auto_gain_target_peak) * 32767.0
+        if target_peak > 0.0 and input_peak > 0.0:
+            gain = max(gain, target_peak / input_peak)
+        gain = clamp(gain, 1.0, float(self.electrical_switch_asr_max_gain))
+        if gain <= 1.0001:
+            return raw_audio, 1.0, int(input_peak), int(input_peak)
+
+        amplified = np.clip(samples * gain, -32768.0, 32767.0).astype(np.int16)
+        output_peak = int(np.max(np.abs(amplified.astype(np.float32))))
+        rospy.loginfo(
+            "Direct switch ASR window %d input gain: gain=%.2fx peak=%d->%d target_peak=%.0f",
+            window_index,
+            gain,
+            int(input_peak),
+            output_peak,
+            target_peak,
+        )
+        return amplified.tobytes(), gain, int(input_peak), output_peak
+
     def record_electrical_switch_audio_window(self, window_seconds, window_index):
         sample_rate = max(8000, int(self.electrical_switch_asr_sample_rate))
         channels = max(1, int(self.electrical_switch_asr_channels))
@@ -1723,9 +1915,24 @@ class RealOwnerSearchBeforeAction:
             rospy.logerr("Direct switch ASR arecord returned no audio")
             return None
 
+        input_rms = audioop.rms(raw_audio, bytes_per_sample)
+        input_peak = audioop.max(raw_audio, bytes_per_sample)
+        raw_audio, applied_gain, _pre_gain_peak, _post_gain_peak = self.amplify_electrical_switch_audio(
+            raw_audio,
+            bytes_per_sample,
+            window_index,
+        )
         rms = audioop.rms(raw_audio, bytes_per_sample)
         peak = audioop.max(raw_audio, bytes_per_sample)
-        rospy.loginfo("Direct switch ASR window %d audio stats: rms=%d peak=%d", window_index, rms, peak)
+        rospy.loginfo(
+            "Direct switch ASR window %d audio stats: raw_rms=%d raw_peak=%d gain=%.2fx rms=%d peak=%d",
+            window_index,
+            input_rms,
+            input_peak,
+            applied_gain,
+            rms,
+            peak,
+        )
 
         if (
             self.electrical_switch_asr_transcribe_from_memory
@@ -2517,6 +2724,12 @@ class RealOwnerSearchBeforeAction:
             self.fall_assist_arm_retract_gripper,
             self.fall_assist_arm_retract_wait,
         )
+        if self.fall_assist_arm_completion_wait > 0:
+            rospy.loginfo(
+                "Fall assist arm retract command complete; waiting %.1fs before next waypoint",
+                self.fall_assist_arm_completion_wait,
+            )
+            rospy.sleep(self.fall_assist_arm_completion_wait)
         return True
 
     def wait_for_hardware_inputs(self):
@@ -2588,14 +2801,76 @@ class RealOwnerSearchBeforeAction:
             )
         return "%s topic %s is not advertised; check the corresponding driver launch" % (label, topic_name)
 
-    def load_waypoint_pose(self):
+    def waypoint_lookup_names(self, waypoint_name):
+        target_name = str(waypoint_name).strip()
+        lookup_names = [target_name]
+        if target_name == self.exit_waypoint_name:
+            for alias in self.exit_waypoint_aliases:
+                if alias and alias not in lookup_names:
+                    lookup_names.append(alias)
+        return lookup_names
+
+    def waypoint_display_name(self, waypoint_name):
+        waypoint_name = str(waypoint_name).strip()
+        return self.waypoint_speech_names.get(waypoint_name, waypoint_name)
+
+    def rename_exit_waypoint_alias_if_needed(self):
+        if not self.rename_exit_waypoint_alias or not self.exit_waypoint_name or not self.exit_waypoint_aliases:
+            return False
+        if not os.path.exists(self.waypoint_file):
+            return False
+
+        try:
+            with open(self.waypoint_file, "r", encoding="utf-8") as waypoint_file:
+                content = waypoint_file.read()
+        except Exception as exc:
+            rospy.logwarn("Unable to read waypoint file for exit rename: %s", exc)
+            return False
+
+        exit_pattern = r"(<Name>\s*)%s(\s*</Name>)" % re.escape(self.exit_waypoint_name)
+        if re.search(exit_pattern, content):
+            return False
+
+        for alias in self.exit_waypoint_aliases:
+            alias_pattern = r"(<Name>\s*)%s(\s*</Name>)" % re.escape(alias)
+
+            def replace_name(match):
+                return match.group(1) + self.exit_waypoint_name + match.group(2)
+
+            renamed_content, count = re.subn(alias_pattern, replace_name, content, count=1)
+            if count <= 0:
+                continue
+            try:
+                with open(self.waypoint_file, "w", encoding="utf-8") as waypoint_file:
+                    waypoint_file.write(renamed_content)
+                rospy.loginfo(
+                    "Renamed waypoint alias %s to %s in %s",
+                    alias,
+                    self.exit_waypoint_name,
+                    self.waypoint_file,
+                )
+                return True
+            except Exception as exc:
+                rospy.logwarn(
+                    "Unable to rename waypoint alias %s to %s in %s: %s",
+                    alias,
+                    self.exit_waypoint_name,
+                    self.waypoint_file,
+                    exc,
+                )
+                return False
+        return False
+
+    def load_waypoint_pose(self, waypoint_name=None):
         if not os.path.exists(self.waypoint_file):
             raise RuntimeError("waypoint file not found: %s" % self.waypoint_file)
 
+        target_name = str(waypoint_name or self.waypoint_name).strip()
+        lookup_names = self.waypoint_lookup_names(target_name)
         root = ET.parse(self.waypoint_file).getroot()
         for waypoint in root.findall("Waypoint"):
-            name = waypoint.findtext("Name", "")
-            if name != self.waypoint_name:
+            name = waypoint.findtext("Name", "").strip()
+            if name not in lookup_names:
                 continue
 
             pose = Pose()
@@ -2608,7 +2883,7 @@ class RealOwnerSearchBeforeAction:
             pose.orientation.w = float(waypoint.findtext("Ori_w", "1"))
             return pose
 
-        raise RuntimeError("waypoint not found: %s in %s" % (self.waypoint_name, self.waypoint_file))
+        raise RuntimeError("waypoint not found: %s in %s" % (target_name, self.waypoint_file))
 
     def clear_move_base_costmaps(self, reason):
         try:
@@ -2678,10 +2953,7 @@ class RealOwnerSearchBeforeAction:
         if robot_pose is None:
             return None
         robot_x, robot_y, robot_yaw = robot_pose
-        cos_yaw = math.cos(robot_yaw)
-        sin_yaw = math.sin(robot_yaw)
-        map_x = robot_x + cos_yaw * float(forward) - sin_yaw * float(lateral)
-        map_y = robot_y + sin_yaw * float(forward) + cos_yaw * float(lateral)
+        map_x, map_y = self.relative_navigation_xy(robot_x, robot_y, robot_yaw, forward, lateral)
         map_yaw = robot_yaw + float(yaw)
 
         goal = MoveBaseGoal()
@@ -2693,6 +2965,14 @@ class RealOwnerSearchBeforeAction:
         goal.target_pose.pose.orientation.z = math.sin(map_yaw * 0.5)
         goal.target_pose.pose.orientation.w = math.cos(map_yaw * 0.5)
         return goal
+
+    @staticmethod
+    def relative_navigation_xy(robot_x, robot_y, robot_yaw, forward, lateral):
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+        map_x = robot_x + cos_yaw * float(forward) - sin_yaw * float(lateral)
+        map_y = robot_y + sin_yaw * float(forward) + cos_yaw * float(lateral)
+        return map_x, map_y
 
     def navigation_goal_remaining_distance(self, goal):
         robot_pose = self.lookup_robot_navigation_pose()
@@ -2771,13 +3051,27 @@ class RealOwnerSearchBeforeAction:
         rospy.loginfo("%s relative navigation complete", label)
         return True
 
-    def send_approach_navigation_goal(self, goal, move_distance, timeout=None, label="owner approach", lidar_guard_distance=None):
+    def send_approach_navigation_goal(
+        self,
+        goal,
+        move_distance,
+        timeout=None,
+        label="owner approach",
+        lidar_guard_distance=None,
+        accept_near_position=True,
+        allow_slow_finish=True,
+        stop_still_duration=None,
+        early_stop_owner_xy=None,
+        early_stop_owner_distance=None,
+    ):
         self.move_base.send_goal(goal)
         start_xy = self.wait_for_odom_xy(timeout=0.2)
         deadline = time.time() + max(0.1, float(timeout if timeout is not None else self.approach_navigation_timeout))
         slow_finish_cycles = 0
         best_remaining = float(move_distance)
         last_progress_time = time.time()
+        movement_seen = False
+        still_since = None
         rate = rospy.Rate(10)
 
         while not rospy.is_shutdown() and time.time() < deadline:
@@ -2791,6 +3085,59 @@ class RealOwnerSearchBeforeAction:
                 travelled = self.xy_distance(start_xy, self.get_latest_odom_xy())
                 if remaining is None and travelled is not None:
                     remaining = max(0.0, float(move_distance) - travelled)
+
+            current_speed = None
+            owner_distance = None
+            if stop_still_duration is not None:
+                current_speed = self.get_latest_odom_linear_speed(max_age=self.approach_odom_speed_max_age)
+                if travelled is not None and travelled >= max(0.03, self.approach_navigation_min_distance):
+                    movement_seen = True
+                elif current_speed is not None and current_speed > self.approach_slow_finish_linear_speed:
+                    movement_seen = True
+
+            if early_stop_owner_xy is not None and early_stop_owner_distance is not None and movement_seen:
+                robot_pose = self.lookup_robot_navigation_pose()
+                if robot_pose is not None:
+                    owner_distance = math.hypot(
+                        float(early_stop_owner_xy[0]) - robot_pose[0],
+                        float(early_stop_owner_xy[1]) - robot_pose[1],
+                    )
+                    if owner_distance <= float(early_stop_owner_distance):
+                        self.move_base.cancel_goal()
+                        self.stop_base()
+                        rospy.loginfo(
+                            "%s stopped in owner safety circle: owner_distance=%.2f threshold=%.2f",
+                            label,
+                            owner_distance,
+                            float(early_stop_owner_distance),
+                        )
+                        return True, ""
+
+            if (
+                stop_still_duration is not None
+                and movement_seen
+                and current_speed is not None
+                and current_speed <= self.approach_slow_finish_linear_speed
+            ):
+                near_target = remaining is not None and remaining <= max(0.20, self.approach_slow_finish_tolerance)
+                if owner_distance is not None:
+                    near_target = near_target or owner_distance <= float(early_stop_owner_distance) + 0.08
+                if near_target:
+                    if still_since is None:
+                        still_since = time.time()
+                    elif time.time() - still_since >= float(stop_still_duration):
+                        self.move_base.cancel_goal()
+                        self.stop_base()
+                        rospy.loginfo(
+                            "%s accepted as arrived after standing still for %.1fs",
+                            label,
+                            float(stop_still_duration),
+                        )
+                        return True, ""
+                else:
+                    still_since = None
+            elif stop_still_duration is not None:
+                still_since = None
 
             if state == GoalStatus.SUCCEEDED:
                 success_tolerance = max(self.approach_navigation_min_distance, self.approach_slow_finish_tolerance)
@@ -2884,6 +3231,319 @@ class RealOwnerSearchBeforeAction:
         self.move_base.cancel_goal()
         return False, "move_base timed out while navigating to %s" % label
 
+    def current_pose_for_plan(self, target_frame):
+        if self.tf_listener is None:
+            return None
+        try:
+            self.tf_listener.waitForTransform(
+                target_frame,
+                self.approach_navigation_base_frame,
+                rospy.Time(0),
+                rospy.Duration(max(0.1, self.approach_navigation_tf_timeout)),
+            )
+            translation, rotation = self.tf_listener.lookupTransform(
+                target_frame,
+                self.approach_navigation_base_frame,
+                rospy.Time(0),
+            )
+        except Exception as exc:
+            rospy.logwarn_throttle(
+                3.0,
+                "Cannot transform current robot pose from %s to %s for waving approach plan check: %s",
+                self.approach_navigation_base_frame,
+                target_frame,
+                exc,
+            )
+            return None
+
+        pose = PoseStamped()
+        pose.header.frame_id = target_frame
+        pose.header.stamp = rospy.Time.now()
+        pose.pose.position.x = float(translation[0])
+        pose.pose.position.y = float(translation[1])
+        pose.pose.position.z = float(translation[2])
+        pose.pose.orientation.x = float(rotation[0])
+        pose.pose.orientation.y = float(rotation[1])
+        pose.pose.orientation.z = float(rotation[2])
+        pose.pose.orientation.w = float(rotation[3])
+        return pose
+
+    def waving_goal_has_global_plan(self, goal):
+        if not self.waving_approach_plan_check:
+            return True
+        frame_id = goal.target_pose.header.frame_id
+        start = self.current_pose_for_plan(frame_id)
+        if start is None:
+            return True
+        try:
+            rospy.wait_for_service(self.waving_approach_plan_service, timeout=0.3)
+            response = self.waving_make_plan(
+                start,
+                goal.target_pose,
+                self.waving_approach_plan_tolerance,
+            )
+        except Exception as exc:
+            rospy.logwarn_throttle(
+                3.0,
+                "Cannot check waving owner approach plan via %s: %s",
+                self.waving_approach_plan_service,
+                exc,
+            )
+            return True
+
+        pose_count = len(response.plan.poses)
+        if pose_count <= 1:
+            rospy.logwarn(
+                "Rejected waving owner candidate with no global plan: frame=%s goal=(%.2f, %.2f)",
+                frame_id,
+                goal.target_pose.pose.position.x,
+                goal.target_pose.pose.position.y,
+            )
+            return False
+        plan_length = 0.0
+        total_turn = 0.0
+        previous_pose = response.plan.poses[0].pose.position
+        previous_heading = None
+        for plan_pose in response.plan.poses[1:]:
+            current_pose = plan_pose.pose.position
+            delta_x = float(current_pose.x) - float(previous_pose.x)
+            delta_y = float(current_pose.y) - float(previous_pose.y)
+            segment_length = math.hypot(delta_x, delta_y)
+            plan_length += segment_length
+            if segment_length > 1e-3:
+                heading = math.atan2(delta_y, delta_x)
+                if previous_heading is not None:
+                    total_turn += abs(signed_angle_diff(heading, previous_heading))
+                previous_heading = heading
+            previous_pose = current_pose
+        start_position = start.pose.position
+        direct_distance = math.hypot(
+            float(goal.target_pose.pose.position.x) - float(start_position.x),
+            float(goal.target_pose.pose.position.y) - float(start_position.y),
+        )
+        if (
+            plan_length > max(0.5, direct_distance) * self.waving_approach_plan_detour_ratio
+            and plan_length > direct_distance + self.waving_approach_plan_detour_margin
+        ):
+            rospy.logwarn(
+                "Rejected waving owner candidate with large detour: plan=%.2fm direct=%.2fm ratio=%.2f",
+                plan_length,
+                direct_distance,
+                plan_length / max(0.01, direct_distance),
+            )
+            return False
+        if total_turn > self.waving_approach_plan_turn_limit:
+            rospy.logwarn(
+                "Rejected waving owner candidate with unstable turns: total_turn=%.2frad limit=%.2frad",
+                total_turn,
+                self.waving_approach_plan_turn_limit,
+            )
+            return False
+        rospy.loginfo_throttle(
+            2.0,
+            "Waving owner approach candidate has global plan with %d poses length=%.2fm direct=%.2fm turns=%.2frad",
+            pose_count,
+            plan_length,
+            direct_distance,
+            total_turn,
+        )
+        return True
+
+    def waving_owner_standoff_candidates(self, position, standoff_distance):
+        distance = max(0.0, float(position.get("distance", 0.0)))
+        if distance <= 1e-3:
+            return []
+
+        owner_x = float(position.get("x", 0.0))
+        owner_y = float(position.get("y", 0.0))
+        if not all(math.isfinite(value) for value in (owner_x, owner_y)):
+            return []
+
+        min_owner_distance = clamp(float(self.waving_approach_min_owner_distance), 0.35, 0.50)
+        max_owner_distance = clamp(float(self.waving_approach_max_owner_distance), min_owner_distance, 0.50)
+        requested_standoff = clamp(abs(float(standoff_distance)), min_owner_distance, max_owner_distance)
+        raw_distances = [requested_standoff] + list(self.waving_approach_candidate_distances)
+        candidate_distances = []
+        seen_distances = set()
+        for raw_distance in raw_distances:
+            try:
+                distance_value = float(raw_distance)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(distance_value):
+                continue
+            owner_clearance = clamp(
+                max(abs(distance_value), self.waving_approach_safety_radius),
+                min_owner_distance,
+                max_owner_distance,
+            )
+            key = round(owner_clearance, 2)
+            if key not in seen_distances:
+                seen_distances.add(key)
+                candidate_distances.append(key)
+
+        raw_angles = list(self.waving_approach_candidate_angles_deg)
+        if not raw_angles:
+            raw_angles = [65, -65, 95, -95, 35, -35, 0]
+        finite_angles = []
+        for raw_angle in raw_angles:
+            try:
+                angle = float(raw_angle)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(angle):
+                finite_angles.append(angle)
+        if all(abs(angle) > 1e-3 for angle in finite_angles):
+            finite_angles.append(0.0)
+
+        unit_x = owner_x / distance
+        unit_y = owner_y / distance
+        near_side_angle = math.atan2(-unit_y, -unit_x)
+        candidates = []
+        seen = set()
+        for owner_clearance in candidate_distances:
+            for angle_deg in finite_angles:
+                offset_angle = near_side_angle + math.radians(angle_deg)
+                goal_x = owner_x + math.cos(offset_angle) * owner_clearance
+                goal_y = owner_y + math.sin(offset_angle) * owner_clearance
+                goal_distance = math.hypot(goal_x, goal_y)
+                if goal_distance <= self.approach_navigation_min_distance:
+                    continue
+
+                face_x = owner_x - goal_x
+                face_y = owner_y - goal_y
+                yaw = math.atan2(face_y, max(0.05, face_x))
+                key = (round(goal_x, 2), round(goal_y, 2), round(yaw, 2))
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append({
+                    "forward": goal_x,
+                    "lateral": goal_y,
+                    "yaw": yaw,
+                    "owner_clearance": owner_clearance,
+                    "angle_deg": angle_deg,
+                    "goal_distance": goal_distance,
+                })
+
+        return candidates
+
+    def navigate_to_waving_owner_candidates(
+        self,
+        position,
+        standoff_distance,
+        timeout=None,
+        label="waving owner move_base approach",
+        lidar_guard_distance=None,
+    ):
+        if not self.waving_approach_candidate_enabled:
+            return self.navigate_to_owner_standoff(
+                position,
+                standoff_distance,
+                timeout=timeout,
+                label=label,
+                lidar_guard_distance=lidar_guard_distance,
+            )
+        if not self.ensure_move_base_for_approach():
+            return False
+
+        candidates = self.waving_owner_standoff_candidates(position, standoff_distance)
+        if not candidates:
+            self.last_approach_failure_reason = "no valid waving owner standoff candidates"
+            rospy.logwarn(self.last_approach_failure_reason)
+            return False
+
+        rospy.loginfo(
+            "Generated %d waving owner approach candidates %.2f-%.2fm from owner",
+            len(candidates),
+            self.waving_approach_min_owner_distance,
+            self.waving_approach_max_owner_distance,
+        )
+        last_error = "no reachable waving owner candidate %.2f-%.2fm from owner" % (
+            self.waving_approach_min_owner_distance,
+            self.waving_approach_max_owner_distance,
+        )
+        for index, candidate in enumerate(candidates, start=1):
+            goal = self.relative_navigation_goal(
+                candidate["forward"],
+                candidate["lateral"],
+                candidate["yaw"],
+            )
+            if goal is None:
+                last_error = "cannot create waving owner candidate %d goal" % index
+                continue
+            if not self.waving_goal_has_global_plan(goal):
+                last_error = "waving owner candidate %d has no global plan" % index
+                continue
+            robot_pose = self.lookup_robot_navigation_pose()
+            if robot_pose is None:
+                last_error = "cannot locate robot pose for waving owner safety circle"
+                continue
+            owner_map_xy = self.relative_navigation_xy(
+                robot_pose[0],
+                robot_pose[1],
+                robot_pose[2],
+                float(position.get("x", 0.0)),
+                float(position.get("y", 0.0)),
+            )
+            rospy.loginfo(
+                "%s trying candidate %d/%d: rel=(%.2f, %.2f) owner_clearance=%.2f angle=%.0f yaw=%.2f map=(%.2f, %.2f)",
+                label,
+                index,
+                len(candidates),
+                candidate["forward"],
+                candidate["lateral"],
+                candidate["owner_clearance"],
+                candidate["angle_deg"],
+                candidate["yaw"],
+                goal.target_pose.pose.position.x,
+                goal.target_pose.pose.position.y,
+            )
+            candidate_label = "%s candidate %d" % (label, index)
+            success, error_message = self.send_approach_navigation_goal(
+                goal,
+                candidate["goal_distance"],
+                timeout=timeout,
+                label=candidate_label,
+                lidar_guard_distance=lidar_guard_distance,
+                stop_still_duration=self.waving_approach_still_duration,
+                early_stop_owner_xy=owner_map_xy,
+                early_stop_owner_distance=self.waving_approach_safety_radius,
+            )
+            obstacle_failure = "blocked by close obstacle" in error_message or "stuck or blocked" in error_message
+            if not success and self.waving_approach_retry_after_clear and not obstacle_failure:
+                rospy.logwarn("%s; clearing costmaps and retrying candidate %d once", error_message, index)
+                self.clear_move_base_costmaps("after %s failure" % candidate_label)
+                goal.target_pose.header.stamp = rospy.Time.now()
+                success, error_message = self.send_approach_navigation_goal(
+                    goal,
+                    candidate["goal_distance"],
+                    timeout=timeout,
+                    label=candidate_label,
+                    lidar_guard_distance=lidar_guard_distance,
+                    stop_still_duration=self.waving_approach_still_duration,
+                    early_stop_owner_xy=owner_map_xy,
+                    early_stop_owner_distance=self.waving_approach_safety_radius,
+                )
+
+            self.stop_base()
+            if success:
+                rospy.loginfo(
+                    "%s reached candidate %d with owner clearance %.2fm",
+                    label,
+                    index,
+                    candidate["owner_clearance"],
+                )
+                return True
+            last_error = error_message or "waving owner candidate %d failed" % index
+            self.last_approach_failure_reason = last_error
+            rospy.logwarn("%s candidate %d failed; trying next candidate", label, index)
+
+        self.stop_base()
+        self.last_approach_failure_reason = last_error
+        rospy.logwarn("%s failed: %s", label, self.last_approach_failure_reason)
+        return False
+
     def navigate_to_owner_standoff(
         self,
         position,
@@ -2947,7 +3607,9 @@ class RealOwnerSearchBeforeAction:
             lidar_guard_distance=lidar_guard_distance,
         )
 
-    def navigate_to_waypoint(self):
+    def navigate_to_waypoint(self, waypoint_name=None):
+        if waypoint_name is not None:
+            self.waypoint_name = str(waypoint_name).strip()
         if not self.navigate_enabled:
             rospy.loginfo("Navigation disabled; assuming robot is already at %s", self.waypoint_name)
             return
@@ -2959,7 +3621,7 @@ class RealOwnerSearchBeforeAction:
         if self.clear_costmaps_before_navigation:
             self.clear_move_base_costmaps("before navigating to %s" % self.waypoint_name)
 
-        pose = self.load_waypoint_pose()
+        pose = self.load_waypoint_pose(self.waypoint_name)
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = "map"
         goal.target_pose.header.stamp = rospy.Time.now()
@@ -4009,12 +4671,12 @@ class RealOwnerSearchBeforeAction:
                 target_distance,
             )
             return True
-        rospy.logwarn(
-            "%s extra-close advance timed out before target: travelled=%s target=%.2f",
+        self.last_approach_failure_reason = "%s extra-close advance timed out before target: travelled=%s target=%.2f" % (
             label,
             "%.2f" % travelled if travelled is not None else "unknown",
             target_distance,
         )
+        rospy.logwarn(self.last_approach_failure_reason)
         return False
 
     def approach_waving_owner(self, owner_candidate=None):
@@ -4028,18 +4690,12 @@ class RealOwnerSearchBeforeAction:
             if image_width > 0:
                 self.owner_track_center = float(det.center_x) / image_width
 
-        target_distance = clamp(abs(self.approach_standoff_distance), 0.35, 1.8)
-        distance_tolerance = max(0.02, self.approach_distance_tolerance)
-        fast_finish_tolerance = clamp(
-            abs(self.approach_fast_finish_tolerance),
-            distance_tolerance,
-            0.30,
-        )
+        target_distance = self.waving_approach_safety_radius
         lidar_guard_distance = max(0.30, self.approach_lidar_stop_distance + self.approach_lidar_margin)
         rospy.loginfo(
-            "Approaching waving owner with move_base: target=%.2fm finish_tol=%.2fm topic=%s",
+            "Approaching waving owner with move_base: safety_radius=%.2fm still_duration=%.1fs topic=%s",
             target_distance,
-            fast_finish_tolerance,
+            self.waving_approach_still_duration,
             self.points_topic,
         )
 
@@ -4077,13 +4733,13 @@ class RealOwnerSearchBeforeAction:
 
         distance = position["distance"]
         bearing = position["bearing"]
-        if distance <= target_distance + fast_finish_tolerance:
+        if distance <= self.waving_approach_safety_radius:
             self.stop_base()
             rospy.loginfo(
-                "Waving owner already within move_base standoff: mode=%s distance=%.2f target=%.2f bearing=%.3f samples=%d",
+                "Waving owner already within safety circle: mode=%s distance=%.2f safety=%.2f bearing=%.3f samples=%d",
                 position["mode"],
                 distance,
-                target_distance,
+                self.waving_approach_safety_radius,
                 bearing,
                 position["samples"],
             )
@@ -4096,7 +4752,7 @@ class RealOwnerSearchBeforeAction:
             return False
 
         nav_lidar_guard = lidar_guard_distance if self.approach_navigation_lidar_guard_enabled else None
-        return self.navigate_to_owner_standoff(
+        return self.navigate_to_waving_owner_candidates(
             position,
             target_distance,
             timeout=self.approach_navigation_timeout,
@@ -4104,22 +4760,23 @@ class RealOwnerSearchBeforeAction:
             lidar_guard_distance=nav_lidar_guard,
         )
 
+    def run_owner_task_at_waypoint(self, waypoint_name):
+        self.waypoint_name = str(waypoint_name).strip()
+        waypoint_label = self.waypoint_display_name(self.waypoint_name)
+        self.owner_track_center = None
+        self.last_pointcloud_reason = ""
+        self.last_approach_failure_reason = ""
 
-    def run(self):
-        self.set_yolo_paused(False)
-        self.wait_for_hardware_inputs()
-
-        if self.speak_on_start:
-            self.say("我开始前往客厅寻找主人。")
-
-        self.navigate_to_waypoint()
+        rospy.loginfo("Starting owner-search task at waypoint %s", self.waypoint_name)
+        self.navigate_to_waypoint(self.waypoint_name)
 
         if self.speak_on_arrival:
-            self.say("我已到达客厅，开始寻找主人。")
+            self.say("我已到达%s，开始寻找主人。" % waypoint_label)
 
         owner_candidate = self.scan_for_owner()
         if owner_candidate is None:
-            self.say("我没有确认主人，请再给我一次机会。")
+            rospy.loginfo("No owner confirmed at waypoint %s; continuing to next waypoint", self.waypoint_name)
+            self.say("我在%s没有确认主人，继续前往下一个航点。" % waypoint_label)
             return False
 
         if self.speak_on_owner_found:
@@ -4132,26 +4789,29 @@ class RealOwnerSearchBeforeAction:
         self.say("识别中。")
         action_label, action_confidence, action_reason = self.recognize_owner_action(owner_candidate)
         rospy.loginfo(
-            "Owner action summary: label=%s confidence=%.2f reason=%s",
+            "Owner action summary at %s: label=%s confidence=%.2f reason=%s",
+            self.waypoint_name,
             action_label,
             action_confidence,
             action_reason,
         )
         normalized_action = str(action_label).strip().lower()
         initial_approach_position = None
-        if normalized_action == "lying":
+        if normalized_action in self.already_fallen_surface_labels:
             normalized_action, lying_surface_reason, initial_approach_position = self.classify_static_lying_surface(
                 owner_candidate
             )
             action_label = normalized_action
             rospy.loginfo(
-                "Static lying surface verdict: label=%s reason=%s",
+                "Already-fallen surface verdict at %s: label=%s reason=%s",
+                self.waypoint_name,
                 normalized_action,
                 lying_surface_reason,
             )
 
         self.say(self.action_to_speech(action_label), hold=self.action_speech_hold)
         if normalized_action in self.fall_approach_action_labels:
+            needs_fall_assist_arm = normalized_action in self.fall_assist_arm_action_labels
             approached = self.approach_fallen_owner(owner_candidate, initial_position=initial_approach_position)
             if approached:
                 extra_close_completed = True
@@ -4162,16 +4822,33 @@ class RealOwnerSearchBeforeAction:
                         timeout=self.fall_approach_extra_close_timeout,
                         label="owner",
                     )
-                if normalized_action in self.fall_assist_arm_action_labels:
-                    self.perform_fall_assist_arm_motion()
-                elif normalized_action in ("lying", "sitting") and extra_close_completed:
-                    self.wait_for_electrical_switch_instruction()
+                    if not extra_close_completed:
+                        rospy.logwarn(
+                            "Owner extra-close advance did not complete for action=%s: %s",
+                            normalized_action,
+                            self.last_approach_failure_reason,
+                        )
             else:
                 rospy.logwarn("Owner blind approach did not complete for action=%s: %s", normalized_action, self.last_approach_failure_reason)
+                self.stop_base()
+            if needs_fall_assist_arm:
+                self.stop_base()
+                rospy.loginfo(
+                    "Completing fall assist arm motion before leaving waypoint %s",
+                    self.waypoint_name,
+                )
+                self.perform_fall_assist_arm_motion()
+            elif normalized_action in ("lying", "sitting"):
+                if not approached:
+                    rospy.logwarn(
+                        "Proceeding to voice interaction after incomplete %s approach",
+                        normalized_action,
+                    )
+                self.wait_for_electrical_switch_instruction()
         elif normalized_action == "waving":
             approached = self.approach_waving_owner(owner_candidate)
             if approached:
-                self.say(self.approach_help_prompt)
+                self.say(self.approach_help_prompt, hold=self.waving_help_pause_seconds)
             else:
                 reason = self.last_approach_failure_reason
                 rospy.logwarn("Waving owner move_base approach did not complete: %s", reason)
@@ -4182,6 +4859,40 @@ class RealOwnerSearchBeforeAction:
                 else:
                     self.say("我看到您在挥手，但还没有成功靠近您。")
         return True
+
+    def run(self):
+        self.set_yolo_paused(False)
+        self.rename_exit_waypoint_alias_if_needed()
+        self.wait_for_hardware_inputs()
+
+        if self.speak_on_start:
+            waypoint_labels = "、".join(self.waypoint_display_name(name) for name in self.task_waypoint_names)
+            self.say("我开始依次前往%s寻找主人。" % waypoint_labels)
+
+        completed_waypoints = 0
+        owner_found_count = 0
+        for waypoint_name in self.task_waypoint_names:
+            if rospy.is_shutdown():
+                break
+            found_owner = self.run_owner_task_at_waypoint(waypoint_name)
+            completed_waypoints += 1
+            if found_owner:
+                owner_found_count += 1
+
+        if self.return_to_exit_when_complete and not rospy.is_shutdown():
+            self.navigate_to_waypoint(self.exit_waypoint_name)
+            if self.speak_on_finish:
+                self.say("所有航点任务已完成，我已到达出口。")
+        elif self.speak_on_finish and not rospy.is_shutdown():
+            self.say("所有航点任务已完成。")
+
+        rospy.loginfo(
+            "task1 owner-search route finished: completed_waypoints=%d owner_found=%d exit=%s",
+            completed_waypoints,
+            owner_found_count,
+            self.exit_waypoint_name if self.return_to_exit_when_complete else "disabled",
+        )
+        return completed_waypoints == len(self.task_waypoint_names)
 
 
 def main():

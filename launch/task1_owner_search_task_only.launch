@@ -1,6 +1,9 @@
 <launch>
   <arg name="waypoint_file" default="/home/$(env USER)/waypoints.xml" />
   <arg name="waypoint_name" default="living_room" />
+  <arg name="task_waypoint_names" default="living_room,kitchen,bedroom,canteen" />
+  <arg name="exit_waypoint_name" default="exit" />
+  <arg name="exit_waypoint_aliases" default="1" />
   <arg name="navigate_enabled" default="true" />
   <arg name="start_voice" default="false" />
   <arg name="start_asr" default="false" />
@@ -30,6 +33,9 @@
     <arg name="start_rviz" value="false" />
     <arg name="waypoint_file" value="$(arg waypoint_file)" />
     <arg name="waypoint_name" value="$(arg waypoint_name)" />
+    <arg name="task_waypoint_names" value="$(arg task_waypoint_names)" />
+    <arg name="exit_waypoint_name" value="$(arg exit_waypoint_name)" />
+    <arg name="exit_waypoint_aliases" value="$(arg exit_waypoint_aliases)" />
     <arg name="navigate_enabled" value="$(arg navigate_enabled)" />
     <arg name="image_topic" value="$(arg image_topic)" />
     <arg name="detections_topic" value="$(arg detections_topic)" />

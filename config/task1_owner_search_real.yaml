@@ -1,4 +1,15 @@
 waypoint_name: living_room
+task_waypoint_names: [living_room, kitchen, bedroom, canteen]
+exit_waypoint_name: exit
+exit_waypoint_aliases: ["1"]
+rename_exit_waypoint_alias: true
+return_to_exit_when_complete: true
+waypoint_speech_names:
+  living_room: 客厅
+  kitchen: 厨房
+  bedroom: 卧室
+  canteen: 餐厅
+  exit: 出口
 waypoint_file: /home/ubuntu20/waypoints.xml
 owner_image_path: /home/ubuntu20/catkin_ws/src/wpb_task1_owner_search/data/owner
 
@@ -121,14 +132,22 @@ action_sitting_thigh_horizontal_ratio: 0.65
 action_sitting_compact_aspect_min: 0.55
 action_sitting_support_score: 0.75
 action_sitting_relaxed_ratio: 0.50
-# Fall detection thresholds. Lower values make one-time falls easier to catch.
+# Fall detection thresholds. The early-frame guards keep a static lying owner
+# from being treated as a fall unless the clip clearly starts upright and then
+# gains multiple falling-transition signals.
 action_fall_center_drop: 0.06
 action_fall_torso_drop: 0.20
 action_fall_aspect_gain: 0.25
 action_fall_lie_ratio_gain: 0.35
 action_fall_late_lie_ratio: 0.45
 action_fall_height_shrink_ratio: 0.82
-action_fall_early_upright_ratio: 0.35
+action_fall_early_upright_ratio: 0.50
+action_fall_early_lie_ratio_max: 0.25
+action_fall_static_lie_ratio: 0.65
+action_fall_early_det_aspect_max: 1.10
+action_fall_static_det_aspect_min: 1.20
+action_fall_min_transition_signals: 2
+already_fallen_surface_labels: [lying, unknown]
 # Static lying classification. If there is no fall transition, use Kinect point
 # cloud surface height to split lying on the floor from lying on sofa/bed/chair.
 lying_surface_classification_enabled: true
@@ -171,6 +190,23 @@ approach_navigation_stuck_timeout: 4.0
 approach_navigation_stuck_min_progress: 0.05
 approach_navigation_stuck_linear_speed: 0.025
 approach_direct_fallback_enabled: false
+# Waving-only dynamic standoff goals. The robot samples nearby side/front points
+# around the owner and sends the first plannable move_base goal. Keep candidates
+# around 40-50cm so the robot stays close enough for interaction without touching feet.
+waving_approach_candidate_enabled: true
+waving_approach_min_owner_distance: 0.45
+waving_approach_max_owner_distance: 0.50
+waving_approach_candidate_distances: [0.45, 0.48, 0.50]
+waving_approach_candidate_angles_deg: [65, -65, 95, -95, 35, -35, 0, 125, -125]
+waving_approach_plan_check: true
+waving_approach_plan_service: /move_base/make_plan
+waving_approach_plan_tolerance: 0.20
+waving_approach_safety_radius: 0.48
+waving_approach_still_duration: 0.8
+waving_approach_plan_detour_ratio: 2.0
+waving_approach_plan_detour_margin: 0.8
+waving_approach_plan_turn_limit: 4.5
+waving_approach_retry_after_clear: false
 approach_angular_gain: 0.45
 approach_max_angular_speed: 0.25
 approach_stop_distance: 0.45
@@ -203,6 +239,9 @@ approach_pointcloud_surface_band: 0.30
 approach_min_depth: 0.35
 approach_max_depth: 5.0
 approach_help_prompt: "请问您需要什么帮助？"
+# Hold briefly after publishing the help prompt so delayed TTS can finish before
+# the robot continues to the next waypoint.
+waving_help_pause_seconds: 3.0
 
 # Real robot response after a fallen / lying / sitting owner is detected. Unlike
 # waving approach, this captures one Kinect point-cloud position before moving,
@@ -248,6 +287,7 @@ fall_assist_arm_gripper_velocity: 5.0
 fall_assist_arm_extend_wait: 3.0
 fall_assist_arm_hold_seconds: 4.0
 fall_assist_arm_retract_wait: 3.0
+fall_assist_arm_completion_wait: 1.0
 fall_assist_arm_command_rate: 5.0
 
 # After a normal sitting or elevated lying owner has been approached, ask for
@@ -259,7 +299,7 @@ electrical_switch_script_path: /home/ubuntu20/catkin_ws/src/wpb_task1_owner_sear
 electrical_switch_script_python: python3
 electrical_switch_script_until_result: true
 electrical_switch_instruction_timeout: 0.0
-electrical_switch_instruction_window_seconds: 3.0
+electrical_switch_instruction_window_seconds: 5.0
 electrical_switch_instruction_asr_settle_seconds: 0.2
 electrical_switch_instruction_max_empty_windows: 0
 electrical_switch_prompt: "请指示。"
@@ -284,10 +324,13 @@ electrical_switch_asr_compute_type: int8
 electrical_switch_asr_language: zh
 electrical_switch_asr_beam_size: 1
 electrical_switch_asr_vad_filter: false
-electrical_switch_asr_no_speech_threshold: 0.6
+electrical_switch_asr_no_speech_threshold: 0.8
 electrical_switch_asr_keep_wav: false
 electrical_switch_asr_wav_dir: /dev/shm
 electrical_switch_asr_transcribe_from_memory: true
+electrical_switch_asr_input_gain: 3.0
+electrical_switch_asr_auto_gain_target_peak: 0.70
+electrical_switch_asr_max_gain: 8.0
 electrical_switch_preload_enabled: true
 electrical_switch_preload_wait_before_prompt: true
 electrical_switch_preload_wait_timeout: 20.0
